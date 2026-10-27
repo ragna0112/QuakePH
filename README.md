@@ -105,11 +105,40 @@ validation, Alembic offline SQL generation and revision discovery, live HTTP 200
 for liveness and HTTP 503 for unavailable database, and browser rendering with
 configuration loaded through Vite's proxy.
 
-Blocked: Docker CLI and Compose are installed, but the Docker engine was not
-running. Container startup, online migration, persistence, and readiness against a
-real PostgreSQL server remain unverified. Successful readiness is covered by a
-mocked probe test, not a real database integration test. The installed Starlette
-emits a deprecation warning about its httpx TestClient integration; tests pass.
+Completed remaining Milestone 1 verification on **2026-10-27, Asia/Manila
+(UTC+08:00)** against a real PostgreSQL 17 container:
+
+- Started Docker Desktop; `docker info` reported Engine 29.4.1.
+- `docker compose up -d --wait` started a healthy database. Port 5432 was
+  occupied, so the ignored local `.env` uses `POSTGRES_PORT=55432` and a matching
+  `DATABASE_URL` port. The committed Compose configuration and lockfiles are unchanged.
+- `alembic upgrade head` succeeded online; `alembic current` and a direct query
+  of `alembic_version` both confirmed `0001_baseline` at head.
+- The running backend returned HTTP 200 for `/health/live` and `/health/ready`;
+  readiness returned `{"status":"ready","database":"ok"}`. The Vite proxy
+  also returned readiness HTTP 200.
+- Browser inspection confirmed the exact text **API and database ready** and
+  an explicit Asia/Manila (UTC+08:00) check-time label.
+- Created the isolated, disposable table
+  `public.quakeph_m1_persistence_verification` with row
+  `(1, 'milestone1-persistence-20261027')`. Ran
+  `docker compose up -d --force-recreate --wait db`; the container ID changed
+  from `455121069a7d…` to `5ae02e7bd09e…` while its mounted volume remained
+  `quakeph_postgres_data`. The exact row survived. Dropped the verification
+  table and confirmed `to_regclass(...) IS NULL` returned true.
+- `SHOW timezone` returned `UTC`.
+- Ran `docker compose stop db`: liveness remained HTTP 200 and readiness
+  returned HTTP 503 with `{"status":"not_ready","database":"unavailable"}`.
+  Restored PostgreSQL using `docker compose up -d --wait db`, confirmed healthy
+  status, and rechecked both endpoints: HTTP 200. Alembic remained at head.
+
+No remaining blockers for Milestone 1. No volume was deleted, and
+`docker compose down -v` was never run. No application code or dependency
+lockfiles changed during this verification. The original passing test run emitted
+an installed Starlette/httpx TestClient deprecation warning; it was non-failing.
+
+The supplied GitHub repository is configured as the local `origin` remote:
+`https://github.com/ragna0112/QuakePH.git`. Local commits do not imply a push.
 
 ## References and next steps
 
