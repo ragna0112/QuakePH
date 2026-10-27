@@ -34,9 +34,9 @@ export default function App() {
     <main>
       <header><span className="eyebrow">EARTHQUAKE DATA PROJECT</span><h1>QuakePH<span>°</span></h1>
         <p>Philippines and surrounding region</p></header>
-      <section aria-labelledby="foundation"><span className="badge">Milestone 1</span>
+      <section aria-labelledby="foundation"><span className="badge">Milestone 2</span>
         <h2 id="foundation">A foundation for understanding our region.</h2>
-        <p>The application shell is ready. Earthquake ingestion, the interactive map, and the event table will arrive in later milestones.</p>
+        <p>The backend can now collect and store real USGS earthquakes. The interactive map and event table will arrive in later milestones.</p>
         <p className="status" role="status">{status}</p>
         {checkedAt && <small>Checked: {new Intl.DateTimeFormat('en-PH', {
           dateStyle: 'medium', timeStyle: 'medium', timeZone: 'Asia/Manila',
@@ -47,7 +47,7 @@ export default function App() {
           : <p>Coverage configuration loads from the backend.</p>}
         <p>This bounding box includes nearby waters. It is not an exact national boundary.</p>
       </section>
-      <footer>No earthquake records have been imported. Future data source: USGS.<br />Display timezone: Asia/Manila (UTC+08:00) · Storage timezone: UTC</footer>
+      <footer>Data source: USGS. Run the backend ingestion command to refresh stored earthquakes.<br />Display timezone: Asia/Manila (UTC+08:00) · Storage timezone: UTC</footer>
     </main>
   )
 }

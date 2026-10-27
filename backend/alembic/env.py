@@ -2,7 +2,7 @@ from alembic import context
 from app.database import Base, get_engine
 from app.config import get_settings
 
-# Import future models here for autogenerate.
+from app import models  # noqa: F401 — register table metadata
 target_metadata = Base.metadata
 
 if context.is_offline_mode():
