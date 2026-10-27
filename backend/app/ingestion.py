@@ -98,14 +98,15 @@ def in_bounds(event, settings):
             and settings.min_longitude <= event['longitude'] <= settings.max_longitude)
 
 
-def validate_feed(payload):
+def validate_feed(payload, *, require_count=True):
     if not isinstance(payload, dict) or payload.get('type') != 'FeatureCollection':
         raise ValueError('response must be a GeoJSON FeatureCollection')
     features, metadata = payload.get('features'), payload.get('metadata')
     if not isinstance(features, list) or not isinstance(metadata, dict):
         raise ValueError('response requires features list and metadata object')
-    if (type(metadata.get('count')) is not int or metadata['count'] != len(features)
-            or metadata.get('status') != 200):
+    count_invalid = ((require_count or 'count' in metadata) and
+                     (type(metadata.get('count')) is not int or metadata['count'] != len(features)))
+    if count_invalid or metadata.get('status') != 200:
         raise ValueError('response metadata status/count is invalid or inconsistent')
     return features
 
@@ -123,26 +124,37 @@ def retry_delay(header, attempt):
     return max(0, min(delay, 30)) if math.isfinite(delay) else 30
 
 
-def fetch_feed(client, record_failure, sleep=time.sleep):
+class RequestFailure(RuntimeError):
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def request_usgs(client, url, record_failure, sleep=time.sleep, params=None):
+    """Shared bounded retry policy for recent feeds and catalog requests."""
     for attempt in range(1, 4):
         response = None
         try:
-            response = client.get(SOURCE)
+            response = client.get(url, params=params)
             response.raise_for_status()
+            return response
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
             code = response.status_code if response is not None else None
             record_failure({'kind': 'request', 'attempt': attempt,
-                            'http_status': code, 'reason': type(exc).__name__})
+                            'http_status': code, 'reason': type(exc).__name__, 'url': url})
             transient = code is None or code in (408, 429, 500, 502, 503, 504)
             if not transient or attempt == 3:
-                raise RuntimeError(f'USGS request failed after {attempt} attempt(s); HTTP {code}') from exc
+                raise RequestFailure(f'USGS request failed after {attempt} attempt(s); HTTP {code}', code) from exc
             sleep(retry_delay(response.headers.get('Retry-After') if response is not None else None, attempt))
-            continue
-        try:
-            return validate_feed(response.json())
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f'invalid USGS response: {exc}') from exc
     raise AssertionError('unreachable')
+
+
+def fetch_feed(client, record_failure, sleep=time.sleep):
+    response = request_usgs(client, SOURCE, record_failure, sleep)
+    try:
+        return validate_feed(response.json())
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f'invalid USGS response: {exc}') from exc
 
 
 def upsert_event(connection, event, seen_at):

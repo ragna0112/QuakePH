@@ -1,19 +1,20 @@
-# QuakePH — Milestones 1–2
+# QuakePH — Milestones 1–3
 
 A student data engineering project covering **Philippines and surrounding region**
 (4–22° latitude, 116–130° longitude). This configurable rectangle includes nearby
 waters; it is not an exact national boundary.
 
-The foundation and real USGS weekly ingestion are implemented. Earthquakes and
-pipeline runs persist in PostgreSQL. The frontend is still a status shell; maps,
-search, historical imports, scheduling, and dashboard data APIs are not implemented.
+The foundation, real USGS weekly ingestion, and resumable historical imports are
+implemented. Earthquakes, pipeline attempts, and historical job/window progress
+persist in PostgreSQL. The frontend is still a status shell; maps, search,
+scheduling, and dashboard data APIs are not implemented.
 No fixtures are inserted into the running application.
 
 ## How the pieces fit
 
 - `backend/app/`: FastAPI serves HTTP endpoints; SQLAlchemy connects to PostgreSQL.
 - `backend/alembic/`: Alembic tracks database schema versions. The baseline revision
-  starts with a baseline, followed by earthquake storage and pipeline run tables.
+  is followed by earthquake storage, pipeline runs, and historical job/window tables.
 - `backend/tests/`: pytest checks health behavior and configuration validation.
 - `frontend/`: React + TypeScript + Vite displays the application shell and API status.
   Vite forwards `/api` and `/health` requests to the backend during development.
@@ -91,7 +92,7 @@ npm --prefix frontend run lint
   database is down.
 - `/health/ready`: HTTP 200 means a real `SELECT 1` succeeded; HTTP 503 means the
   database is unavailable. It checks connectivity, not migration currency. Use
-  `alembic current` to confirm `1522abd3414e (head)` separately.
+  `alembic current` to confirm `69e8baad5d8e (head)` separately.
 - The dashboard should say **API and database ready** and show configured bounds.
   Refresh the page after changing server/database state; status is checked on load.
 - To observe the difference, run `docker compose stop db`, check both health URLs,
@@ -239,7 +240,8 @@ retried; malformed successful responses fail without retrying.
 Tracking starts and finalizes in separate committed transactions so a data
 rollback cannot erase failure history. If PostgreSQL itself cannot persist
 tracking, the CLI exits 1 and explicitly reports that limitation. A killed
-process can leave a run `running`; automatic recovery is not implemented.
+recent-feed process can still leave a run `running`; historical jobs have the
+explicit lock-based recovery described below.
 Concurrent transactions may fail on lock timeout/deadlock; PostgreSQL preserves
 uniqueness/revision ordering and the run fails rather than claiming success.
 
@@ -277,6 +279,194 @@ Executed on **2026-10-28, Asia/Manila (UTC+08:00)**:
   seen behavior, partial/empty runs, retry accounting, and failed-run persistence
   after a rolled-back earthquake insert. Real source rows were not edited.
 
+## Milestone 3: historical backfills with checkpoints
+
+A **backfill** collects older earthquakes through the USGS catalog. A **checkpoint**
+is a completed time window saved in PostgreSQL in the same transaction as its
+accepted earthquake rows. **Idempotency** means reimporting those events retains
+one row per USGS ID and applies only newer revisions. **Resume** means reopening
+an existing job by UUID and continuing its unfinished windows.
+
+### Commands
+
+Run from the project root, keeping the private `.env` and PostgreSQL host port
+**55432** unchanged. No new dependencies or lockfile changes are needed.
+
+```sh
+docker compose up -d --wait
+.tools/bin/uv run --directory backend --locked alembic upgrade head
+.tools/bin/uv run --directory backend --locked python -m app.historical import --start 2020-01-01 --end 2020-01-08 --window-days 1
+```
+
+The command prints and flushes the durable job ID before starting network work.
+If interrupted or failed, replace the UUID below with that job ID:
+
+```sh
+.tools/bin/uv run --directory backend --locked python -m app.historical resume df688a1e-a05b-48a2-8e6d-dd9d05ac5ac7
+```
+
+This example job already succeeded on this machine, so resuming it simply reports
+its existing completed progress without making requests. To refresh a completed
+range against newer catalog data, run a **new import** for the same range.
+Resume never re-fetches completed windows. It uses the saved geographic scope,
+source, window boundaries, limit, ordering, event type, and timeout settings,
+even if environment defaults have changed. It still connects to the currently
+configured database, where the job must exist.
+
+The recent-feed CLI remains unchanged:
+
+```sh
+.tools/bin/uv run --directory backend --locked python -m app.ingestion
+```
+
+Historical commands exit 0 only for a fully successful job. Failed/incomplete or
+busy jobs exit 1; malformed dates, UUIDs, and invalid/reversed ranges exit 2.
+
+### Dates, boundaries, and bounded requests
+
+Inputs must be calendar dates in `YYYY-MM-DD`. Both dates mean **UTC midnight**,
+not midnight in Asia/Manila. The internal range is **[start, end)**: include the
+start, exclude the end. For example, `2020-01-01` to `2020-01-08` covers all seven
+UTC days January 1–7 (January 1 08:00 through January 8 08:00 Asia/Manila, with the
+latter instant excluded). Equal or reversed ranges are rejected before DB work.
+
+The implementation follows the [official USGS catalog documentation](https://earthquake.usgs.gov/fdsnws/event/1/):
+
+- Initial windows default to 7 days; `--window-days` accepts 1–31. Requests filter
+  `eventtype=earthquake` and the saved bounding box, return GeoJSON, and request
+  `orderby=time-asc`. Accepted records are also sorted locally by time, ID, and
+  source revision for stable ordering of timestamp ties.
+- USGS caps query results at **20,000**. A count request checks each window first.
+  At or above that limit, the window is conservatively bisected in time instead
+  of importing possibly truncated results. Split parents and their children are
+  saved atomically; only children become event checkpoints.
+- Query requests explicitly set `limit=20000`. A query returning that many
+  features also triggers subdivision, covering growth after the count request.
+  HTTP 400 triggers a fresh count; only confirmed saturation is treated as
+  overflow. Other bad queries fail instead of generating endless subdivisions.
+  There is no offset pagination.
+- Splits use integer millisecond boundaries. A **1ms minimum window** still at
+  the limit fails with an explicit completeness error. There is no silent
+  truncation or spatial fallback. That job cannot finish until the source drops
+  below the cap or a differently scoped new job can be used.
+- USGS includes both time endpoints. Requests use those inclusive bounds, then
+  the application filters each record to its window's [start, end). A feature at
+  a shared endpoint may be fetched twice but is accepted in the later window
+  only. The USGS ID primary key and existing revision-aware upserts also protect
+  against duplicates. Nothing deletes rows absent from later responses.
+- HTTP 204 and valid empty FeatureCollections complete an empty window.
+  Catalog metadata may omit `count`; when present it must match the features
+  list. Envelope/status checks remain mandatory. Recent-feed validation retains
+  its original required-count behavior.
+
+**The catalog can change between requests.** Counts and results are not a source
+snapshot, and checkpointed windows are not automatically revisited on resume.
+Source origin times, additions, and revisions can change during a backfill. A
+new job can refresh a range, but cannot guarantee a point-in-time source snapshot.
+
+### Progress, failures, and safe recovery
+
+`import_jobs` stores the requested range, settings snapshot, execution count,
+status, timestamps, and last error. `import_windows` stores the window tree,
+status, attempt count, last-attempt timestamps, counters, and last error.
+Each window attempt has a separate `pipeline_runs` row linked by
+`import_window_id`, including errors from prior failed attempts.
+
+- Window states are `pending`, `running`, `completed`, `failed`, or `split`.
+  Split parents describe planning work, not extra completed time coverage.
+  Completed progress is the completed leaf windows; all remaining leaves must
+  complete before the job is successful.
+- `executions` counts accepted job executions/resumes; resuming an already
+  successful job leaves it unchanged. `window_attempts` counts processing tries,
+  including failed, interrupted, and splitting tries. These are not event totals
+  or the number of HTTP calls (a try can make count/query requests and retries).
+- The final JSON's `committed_counters` sums **completed windows only**, not all
+  attempts. `fetched` can include shared endpoint features; `outside_time` counts
+  valid earthquakes filtered by the exclusive time boundary. The other counters
+  retain Milestone 2 meanings. Planning parents store `catalog_count` capacity
+  observations; these can become stale and are not imported event totals.
+- `total_failed_request_attempts` sums HTTP/transport failures across **all**
+  attempts, including failed attempts and split parents. Individual attempt
+  errors retain URL, HTTP status, retry number, and exception type. Failed
+  response validation is a window error, not a failed HTTP request.
+- Historical validation is stricter than the recent feed's partial-run policy:
+  any rejected record fails that window and rolls back all of its event writes.
+  Rejection reasons/indexes (first 100) and full rejection counts persist in the
+  failed attempt; inserted/updated/unchanged reset to zero. A new attempt on
+  resume retries the entire window. Earlier completed windows remain committed.
+- The shared HTTP policy still uses at most 3 attempts with bounded backoff and
+  Retry-After handling, 10-second connect and 30-second other HTTP timeouts.
+  Processing stops at the first failed window; later work remains pending.
+- A PostgreSQL advisory transaction lock prevents another executor from running
+  the same job. It is held on a dedicated connection and released on disconnect
+  or process exit. Resume acquires this lock **before** treating earlier running
+  windows/attempts as interrupted; it never assumes that a timestamp alone proves
+  abandonment. A new ownership token is checked under a job-row lock in every
+  write transaction, preventing an old worker from committing after a takeover.
+
+If the database is unavailable, tracking itself may not be writable; the CLI
+reports the job as incomplete rather than claiming success. Database detection
+of a dead connection can take time; a busy job is not force-unlocked. Recent-feed
+runs have no historical job lock and are not recovered by this command. There
+is no scheduler, progress API, cancellation UI, or automatic resume daemon.
+
+### Inspect jobs and attempts
+
+Open the same `psql` prompt documented above, then run:
+
+```sql
+SELECT id, start_at, end_at, status, executions, scope, settings, last_error
+FROM import_jobs ORDER BY created_at DESC;
+
+SELECT job_id, status, count(*) AS windows, sum(attempts) AS window_attempts
+FROM import_windows GROUP BY job_id, status ORDER BY job_id, status;
+
+SELECT job_id, id, parent_id, start_at, end_at, status, attempts,
+       started_at, ended_at, counters, last_error
+FROM import_windows ORDER BY job_id, start_at, end_at;
+
+SELECT w.job_id, r.import_window_id, r.id AS attempt_id, r.status,
+       r.started_at, r.ended_at, r.fetched, r.inserted, r.updated, r.unchanged,
+       r.rejected, r.failed_request_attempts, r.errors
+FROM pipeline_runs r JOIN import_windows w ON w.id = r.import_window_id
+ORDER BY r.started_at DESC;
+```
+
+### Milestone 3 verification
+
+```sh
+.tools/bin/uv run --directory backend --locked pytest --postgres
+.tools/bin/uv run --directory backend --locked alembic check
+```
+
+Executed on **2026-10-28, Asia/Manila (UTC+08:00)**:
+
+- Migration `69e8baad5d8e` applied online; Alembic found no schema drift.
+- 72 backend tests passed, including 23 PostgreSQL test cases in disposable
+  schemas. Tests covered UTC dates, exact start/end events, adjacent-window
+  deduplication, preflight and query-time overflow, minimum-window failure,
+  empty responses, earlier checkpoints surviving failure, resume with changed
+  defaults, interrupted-run recovery, same-job lock contention, stale-owner
+  fencing, atomic checkpoint rollback, rejected-record persistence, and reimports.
+  The existing Starlette/httpx deprecation warning remains non-failing.
+- Live import used **[2020-01-01T00:00:00Z, 2020-01-08T00:00:00Z)**, with seven
+  daily windows. Its first attempt exposed a legitimate empty catalog response
+  without `metadata.count`; it failed safely without a checkpoint. After fixing
+  catalog validation and adding a regression test, the same job resumed.
+  That failed attempt is retained in pipeline history (no fabricated outage).
+
+| Job | Executions | Window attempts | Completed windows | Fetched | Inserted | Updated | Unchanged |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `df688a1e-a05b-48a2-8e6d-dd9d05ac5ac7` | 2 | 8 | 7 | 12 | 12 | 0 | 0 |
+| `98214226-b4ad-4fd9-8e96-dbd46d947345` | 1 | 7 | 7 | 12 | 0 | 0 | 12 |
+
+Both jobs finished successfully, with no pending/failed windows, rejected records,
+or failed HTTP attempts. SQL confirmed 12 rows in that historical interval and
+17 total stored rows with 17 distinct USGS IDs. The duplicate-ID query returned
+no rows; no test schemas remained. Controlled failures used test transports and
+isolated PostgreSQL data, not deliberate USGS disruptions or edits to real rows.
+Both dependency lockfiles and the PostgreSQL configuration are unchanged.
+
 ## References and next steps
 
 Official setup references: [FastAPI](https://fastapi.tiangolo.com/deployment/manually/),
@@ -285,6 +475,6 @@ Official setup references: [FastAPI](https://fastapi.tiangolo.com/deployment/man
 USGS sources: [USGS catalog documentation](https://earthquake.usgs.gov/fdsnws/event/1/)
 and [recent all-week GeoJSON](https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson).
 
-Milestone 2 stops at ingestion and storage. Historical imports, scheduling,
-dashboard data endpoints, and Leaflet map features remain for later milestones.
+Milestone 3 stops at resumable historical imports. Scheduling, dashboard data
+endpoints, and Leaflet map features remain for later milestones.
 Nothing has been pushed or deployed.
