@@ -1,0 +1,13 @@
+main { max-width: 920px; margin: auto; padding: 64px 24px; }
+header { margin-bottom: 42px; }
+.eyebrow { font-size: .75rem; letter-spacing: .18em; font-weight: 700; }
+h1 { font-size: clamp(3rem, 8vw, 5rem); letter-spacing: -.065em; margin: 10px 0; }
+h1 span { color: #da653b; }
+header p { font-size: 1.2rem; }
+section { background: white; border: 1px solid #d6e3de; border-radius: 16px; padding: 28px; margin-bottom: 20px; }
+h2 { font-size: 1.4rem; line-height: 1.4; }
+p { line-height: 1.7; }
+.badge { font-size: .8rem; color: #165c4d; background: #e4f3eb; border-radius: 20px; padding: 6px 12px; }
+.status { border-top: 1px solid #e1e9e5; padding-top: 18px; font-weight: 600; }
+small, footer { color: #526b67; line-height: 1.8; }
+@media (max-width: 500px) { main { padding: 32px 16px; } section { padding: 20px; } }
