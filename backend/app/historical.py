@@ -1,6 +1,6 @@
 """Manual catalog backfills with durable, atomic window checkpoints."""
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 import json
 import re
@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import httpx
 from sqlalchemy import func, select, text
 
+from app.coordination import (JobBusy, OwnershipLost, session_lock, transaction)
 from app.config import get_settings
 from app.database import get_engine
 from app.ingestion import (COUNTERS, COVERAGE, RequestFailure, in_bounds, normalize,
@@ -23,14 +24,6 @@ DEFAULT_SETTINGS = dict(version=1, source=CATALOG, window_days=7,
                         eventtype='earthquake', timeout_seconds=30, connect_timeout_seconds=10)
 
 
-class JobBusy(RuntimeError):
-    pass
-
-
-class OwnershipLost(RuntimeError):
-    pass
-
-
 def parse_date(value):
     if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
         raise argparse.ArgumentTypeError('use YYYY-MM-DD (UTC midnight)')
@@ -40,7 +33,7 @@ def parse_date(value):
         raise argparse.ArgumentTypeError('invalid calendar date') from exc
 
 
-def create_job(engine, start, end, settings, window_days=7):
+def create_job(engine, start, end, settings, window_days=7, connection=None):
     if start.tzinfo != timezone.utc or end.tzinfo != timezone.utc or start >= end:
         raise ValueError('require UTC start < exclusive end')
     if not 1 <= window_days <= 31:
@@ -50,7 +43,7 @@ def create_job(engine, start, end, settings, window_days=7):
         'min_latitude', 'max_latitude', 'min_longitude', 'max_longitude')}
     scope['label'] = COVERAGE
     configuration = DEFAULT_SETTINGS | {'window_days': window_days}
-    with engine.begin() as connection:
+    with (nullcontext(connection) if connection is not None else transaction(engine)) as connection:
         connection.execute(jobs.insert().values(id=job_id, start_at=start, end_at=end,
             scope=scope, settings=configuration, status='pending', created_at=utcnow()))
         cursor = start
@@ -63,26 +56,15 @@ def create_job(engine, start, end, settings, window_days=7):
     return job_id
 
 
-@contextmanager
 def job_lock(engine, job_id):
-    # Transaction-scoped advisory lock releases on disconnect/process death.
-    # This connection holds only the lock; checkpoint transactions use the pool.
-    key = int.from_bytes(job_id.bytes[:8], 'big', signed=True)
-    with engine.connect() as connection:
-        transaction = connection.begin()
-        try:
-            if not connection.execute(text('SELECT pg_try_advisory_xact_lock(:key)'), {'key': key}).scalar_one():
-                raise JobBusy(f'Job {job_id} is already being executed; no work was changed')
-            yield
-        finally:
-            transaction.rollback()
+    return session_lock(engine, f'historical:{job_id}')
 
 
 @contextmanager
-def owned_transaction(engine, job_id, token):
+def owned_transaction(engine, job_id, token, allow_stopping=False):
     # Fencing protects against an old worker whose lock connection disappeared
     # while an HTTP request was in flight. Lock acquisition alone cannot do that.
-    with engine.begin() as connection:
+    with transaction(engine, allow_stopping=allow_stopping) as connection:
         owner = connection.execute(select(jobs.c.owner_token).where(jobs.c.id == job_id)
                                    .with_for_update()).scalar_one()
         if owner != token:
@@ -230,7 +212,7 @@ def attempt_window(engine, job, window, token, client, sleep):
                 # API sorts time ascending; stable local tie ordering avoids relying
                 # on unspecified server ordering of events at the same millisecond.
                 for event in sorted(accepted, key=lambda e: (e['event_time'], e['usgs_id'], e['source_updated_at'])):
-                    counts[upsert_event(connection, event, utcnow())] += 1
+                    counts[upsert_event(connection, event, utcnow(), run_id, job['scope'])] += 1
                 if counts['rejected']:
                     raise ValueError('Rejected records prevent a complete checkpoint; window data rolled back')
                 disposition = 'completed'
@@ -249,7 +231,7 @@ def attempt_window(engine, job, window, token, client, sleep):
                    'detail': str(exc)[:500] if isinstance(exc, (ValueError, RuntimeError))
                    else 'Window failed; data transaction rolled back. Check PostgreSQL/schema or response encoding.'}
         errors.append(message)
-        with owned_transaction(engine, job_id, token) as connection:
+        with owned_transaction(engine, job_id, token, allow_stopping=True) as connection:
             connection.execute(windows.update().where(windows.c.id == window_id).values(
                 status='failed', ended_at=utcnow(), counters=counts, last_error=message))
             connection.execute(runs.update().where(runs.c.id == run_id).values(
@@ -263,7 +245,7 @@ def execute_job(engine, job_id, client=None, sleep=time.sleep):
     job_id = UUID(str(job_id))
     with job_lock(engine, job_id):
         token = uuid4()
-        with engine.begin() as connection:
+        with transaction(engine) as connection:
             job = connection.execute(select(jobs).where(jobs.c.id == job_id).with_for_update()).mappings().one_or_none()
             if job is None:
                 raise ValueError(f'Unknown import job {job_id}')

@@ -98,7 +98,7 @@ def test_bounded_http_failures(status, attempts):
     assert len(delays) == attempts - 1
 
 
-def test_duplicate_and_revision_content_rules(pg_engine):
+def test_duplicate_and_revision_content_rules(pg_engine, source_run):
     first = datetime(2026, 1, 1, tzinfo=timezone.utc)
     original = normalize(feature())
     newer_raw = feature(updated=1700000001000); newer_raw['properties']['mag'] = 5.2
@@ -108,7 +108,7 @@ def test_duplicate_and_revision_content_rules(pg_engine):
         (original, 'inserted'), (original, 'unchanged'), (newer, 'updated'),
         (original, 'unchanged'), (same_revision, 'unchanged')]):
         with pg_engine.begin() as connection:
-            assert upsert_event(connection, event, first + timedelta(seconds=index)) == expected
+            assert upsert_event(connection, event, first + timedelta(seconds=index), source_run) == expected
     with pg_engine.connect() as connection:
         rows = connection.execute(select(earthquakes)).mappings().all()
     assert len(rows) == 1
@@ -118,15 +118,15 @@ def test_duplicate_and_revision_content_rules(pg_engine):
     assert row['first_seen_at'] == first
     assert row['last_seen_at'] == first + timedelta(seconds=4)
     with pg_engine.begin() as connection:
-        upsert_event(connection, original, first - timedelta(seconds=1))
+        upsert_event(connection, original, first - timedelta(seconds=1), source_run)
         assert connection.execute(select(earthquakes.c.last_seen_at)).scalar_one() == row['last_seen_at']
 
 
-def test_concurrent_inserts_and_revisions(pg_engine):
+def test_concurrent_inserts_and_revisions(pg_engine, source_run):
     def store(revision):
         with pg_engine.begin() as connection:
             return upsert_event(connection, normalize(feature(updated=1700000000000 + revision)),
-                                datetime.now(timezone.utc))
+                                datetime.now(timezone.utc), source_run)
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(store, [2, 1, 5, 3, 5, 0, 4, 5]))
     assert results.count('inserted') == 1
@@ -178,8 +178,8 @@ def test_network_failure_persisted(pg_engine):
 def test_rollback_preserves_failed_run_and_attempts(pg_engine):
     from app.ingestion import upsert_event as real_upsert
     replies = iter([httpx.Response(503), httpx.Response(200, json=feed(feature()))])
-    def insert_then_fail(connection, event, seen):
-        real_upsert(connection, event, seen)
+    def insert_then_fail(connection, event, seen, run_id, scope):
+        real_upsert(connection, event, seen, run_id, scope)
         raise RuntimeError('controlled transaction failure')
     with httpx.Client(transport=httpx.MockTransport(lambda r: next(replies))) as client:
         with patch('app.ingestion.upsert_event', side_effect=insert_then_fail):

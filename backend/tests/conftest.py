@@ -24,3 +24,14 @@ def pg_engine(request):
     finally:
         with engine.begin() as connection:
             connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+
+
+@pytest.fixture
+def source_run(pg_engine):
+    from app.models import pipeline_runs
+    from app.ingestion import utcnow
+    identifier = uuid4()
+    with pg_engine.begin() as connection:
+        connection.execute(pipeline_runs.insert().values(id=identifier, ingestion_type='fixture',
+            started_at=utcnow(), status='running', source='fixture', scope={}, errors=[]))
+    return identifier

@@ -8,12 +8,13 @@ import time
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import func, update
+from sqlalchemy import func, update, select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.config import get_settings
 from app.database import get_engine
-from app.models import earthquakes, pipeline_runs
+from app.models import earthquakes, pipeline_runs, revision_history
+from app.coordination import check_guards, transaction, OwnershipLost
 
 SOURCE = 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson'
 COVERAGE = 'Philippines and surrounding region'
@@ -135,7 +136,9 @@ def request_usgs(client, url, record_failure, sleep=time.sleep, params=None):
     for attempt in range(1, 4):
         response = None
         try:
+            check_guards()
             response = client.get(url, params=params)
+            check_guards()
             response.raise_for_status()
             return response
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
@@ -157,34 +160,64 @@ def fetch_feed(client, record_failure, sleep=time.sleep):
         raise ValueError(f'invalid USGS response: {exc}') from exc
 
 
-def upsert_event(connection, event, seen_at):
-    values = dict(event, first_seen_at=seen_at, last_seen_at=seen_at)
-    # Unique-key conflict handling waits for concurrent inserts. No read-before-write.
+SOURCE_FIELDS = ('event_time', 'magnitude', 'magnitude_type', 'place', 'longitude',
+                 'latitude', 'depth_km', 'review_status', 'event_type', 'source_url', 'source_state')
+
+
+def scope_values(settings):
+    if isinstance(settings, dict):
+        return {k: settings[k] for k in ('min_latitude', 'max_latitude', 'min_longitude', 'max_longitude')}
+    return {k: getattr(settings, k) for k in ('min_latitude', 'max_latitude', 'min_longitude', 'max_longitude')}
+
+
+def coverage(event, scope):
+    return ('inside' if scope['min_latitude'] <= event['latitude'] <= scope['max_latitude']
+            and scope['min_longitude'] <= event['longitude'] <= scope['max_longitude'] else 'outside')
+
+
+def json_value(value):
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def upsert_event(connection, event, seen_at, run_id, scope=None):
+    """Row lock serializes revision comparison, history, and current content."""
+    check_guards()
+    scope = scope_values(scope or get_settings())
+    event = dict(event, source_state=event.get('source_state',
+                 'deleted' if event.get('review_status') == 'deleted' else 'active'))
+    values = dict(event, first_seen_at=seen_at, last_seen_at=seen_at,
+                  coverage_status=coverage(event, scope), coverage_scope=scope)
     created = connection.execute(insert(earthquakes).values(**values).on_conflict_do_nothing(
         index_elements=[earthquakes.c.usgs_id]).returning(earthquakes.c.usgs_id)).scalar_one_or_none()
     if created is not None:
         return 'inserted'
-    # Conditional UPDATE rechecks the revision predicate after acquiring the row lock.
-    revised = connection.execute(update(earthquakes).where(
-        earthquakes.c.usgs_id == event['usgs_id'],
-        earthquakes.c.source_updated_at < event['source_updated_at'],
-    ).values(**event, last_seen_at=func.greatest(earthquakes.c.last_seen_at, seen_at))
-      .returning(earthquakes.c.usgs_id)).scalar_one_or_none()
-    if revised is not None:
-        return 'updated'
+    previous = connection.execute(select(earthquakes).where(
+        earthquakes.c.usgs_id == event['usgs_id']).with_for_update()).mappings().one()
+    latest = event['source_updated_at'] > previous['source_updated_at']
+    current = event if latest else previous
+    changes = {field: {'old': json_value(previous[field]), 'new': json_value(event[field])}
+               for field in SOURCE_FIELDS if previous[field] != event[field]} if latest else {}
+    if latest:
+        # Empty changes means the source clock advanced without tracked field changes.
+        # Still retain one provenance entry and the latest accepted raw JSON.
+        connection.execute(revision_history.insert().values(id=uuid4(), usgs_id=event['usgs_id'],
+            previous_updated_at=previous['source_updated_at'], new_updated_at=event['source_updated_at'],
+            changes=changes, pipeline_run_id=run_id, recorded_at=seen_at))
     connection.execute(update(earthquakes).where(earthquakes.c.usgs_id == event['usgs_id']).values(
-        last_seen_at=func.greatest(earthquakes.c.last_seen_at, seen_at)))
-    return 'unchanged'
+        **(event if latest else {}),
+        last_seen_at=func.greatest(earthquakes.c.last_seen_at, seen_at),
+        coverage_status=coverage(current, scope), coverage_scope=scope))
+    return 'updated' if latest else 'unchanged'
 
 
-def ingest(engine, settings, client, sleep=time.sleep):
-    run_id = uuid4()
+def ingest(engine, settings, client, sleep=time.sleep, run_id=None):
+    run_id = run_id or uuid4()
     counts = dict.fromkeys(COUNTERS, 0)
     errors = []
     scope = dict(label=COVERAGE, min_latitude=settings.min_latitude,
                  max_latitude=settings.max_latitude, min_longitude=settings.min_longitude,
                  max_longitude=settings.max_longitude)
-    with engine.begin() as connection:
+    with transaction(engine) as connection:
         connection.execute(pipeline_runs.insert().values(
             id=run_id, ingestion_type='recent_week', started_at=utcnow(), status='running',
             source=SOURCE, scope=scope, errors=[]))
@@ -193,7 +226,7 @@ def ingest(engine, settings, client, sleep=time.sleep):
         counts['failed_request_attempts'] += 1
         errors.append(detail)
         # Separate committed transaction survives later ingestion rollback/crash.
-        with engine.begin() as connection:
+        with transaction(engine) as connection:
             connection.execute(pipeline_runs.update().where(pipeline_runs.c.id == run_id).values(
                 failed_request_attempts=counts['failed_request_attempts'], errors=errors))
 
@@ -201,7 +234,7 @@ def ingest(engine, settings, client, sleep=time.sleep):
     try:
         features = fetch_feed(client, request_failed, sleep)
         counts['fetched'] = len(features)
-        with engine.begin() as connection:
+        with transaction(engine) as connection:
             for index, feature in enumerate(features):
                 try:
                     event = normalize(feature)
@@ -217,17 +250,23 @@ def ingest(engine, settings, client, sleep=time.sleep):
                     counts['out_of_scope'] += 1
                     continue
                 counts['in_scope'] += 1
-                counts[upsert_event(connection, event, utcnow())] += 1
-        status = 'partial' if counts['rejected'] else 'success'
+                counts[upsert_event(connection, event, utcnow(), run_id, scope)] += 1
+            status = 'partial' if counts['rejected'] else 'success'
+            connection.execute(pipeline_runs.update().where(pipeline_runs.c.id == run_id).values(
+                **counts, status=status, ended_at=utcnow(), errors=errors))
+    except OwnershipLost:
+        raise
     except Exception as exc:
+        status = 'failed'
         # Data transaction is atomic: these counters mean committed classifications.
         counts.update(inserted=0, updated=0, unchanged=0)
         errors.append({'kind': 'run', 'reason': type(exc).__name__,
                        'detail': str(exc)[:500] if isinstance(exc, (ValueError, RuntimeError))
                        else 'Ingestion failed; data transaction rolled back. Check database availability and schema.'})
-    with engine.begin() as connection:
-        connection.execute(pipeline_runs.update().where(pipeline_runs.c.id == run_id).values(
-            **counts, status=status, ended_at=utcnow(), errors=errors))
+    if status == 'failed':
+        with transaction(engine, allow_stopping=True) as connection:
+            connection.execute(pipeline_runs.update().where(pipeline_runs.c.id == run_id).values(
+                **counts, status=status, ended_at=utcnow(), errors=errors))
     return dict(run_id=str(run_id), status=status, **counts, errors=errors)
 
 

@@ -71,3 +71,67 @@ import_windows = Table(
 
 pipeline_runs.append_column(Column('import_window_id', UUID(as_uuid=True),
                                    ForeignKey('import_windows.id', name='fk_pipeline_runs_import_window'), index=True))
+
+
+earthquakes.append_column(Column('coverage_status', String(20), nullable=False, server_default='inside'))
+earthquakes.append_column(Column('coverage_scope', JSONB))
+earthquakes.append_column(Column('source_state', String(20), nullable=False, server_default='active'))
+earthquakes.append_column(Column('source_checked_at', DateTime(timezone=True)))
+
+revision_history = Table(
+    'revision_history', Base.metadata,
+    Column('id', UUID(as_uuid=True), primary_key=True),
+    Column('usgs_id', Text, ForeignKey('earthquakes.usgs_id'), nullable=False, index=True),
+    Column('previous_updated_at', DateTime(timezone=True), nullable=False),
+    Column('new_updated_at', DateTime(timezone=True), nullable=False),
+    Column('changes', JSONB, nullable=False),
+    Column('pipeline_run_id', UUID(as_uuid=True), ForeignKey('pipeline_runs.id'), nullable=False),
+    Column('recorded_at', DateTime(timezone=True), nullable=False),
+    UniqueConstraint('usgs_id', 'new_updated_at', name='revision_history_event_version'),
+)
+
+reconciliations = Table(
+    'reconciliations', Base.metadata,
+    Column('id', UUID(as_uuid=True), primary_key=True),
+    Column('historical_job_id', UUID(as_uuid=True), ForeignKey('import_jobs.id'), nullable=False, unique=True),
+    Column('start_at', DateTime(timezone=True), nullable=False),
+    Column('end_at', DateTime(timezone=True), nullable=False),
+    Column('scope', JSONB, nullable=False), Column('settings', JSONB, nullable=False),
+    Column('status', String(20), nullable=False),
+    Column('created_at', DateTime(timezone=True), nullable=False),
+    Column('ended_at', DateTime(timezone=True)), Column('owner_token', UUID(as_uuid=True)),
+    Column('last_error', JSONB),
+)
+
+reconciliation_events = Table(
+    'reconciliation_events', Base.metadata,
+    Column('reconciliation_id', UUID(as_uuid=True), ForeignKey('reconciliations.id'), primary_key=True),
+    Column('usgs_id', Text, ForeignKey('earthquakes.usgs_id'), primary_key=True),
+    Column('status', String(30), nullable=False, server_default='pending'),
+    Column('attempts', Integer, nullable=False, server_default='0'),
+    Column('checked_at', DateTime(timezone=True)), Column('related_id', Text),
+    Column('pipeline_run_id', UUID(as_uuid=True), ForeignKey('pipeline_runs.id')),
+    Column('counters', JSONB, nullable=False, server_default='{}'), Column('last_error', JSONB),
+)
+
+workers = Table(
+    'workers', Base.metadata,
+    Column('id', UUID(as_uuid=True), primary_key=True),
+    Column('hostname', Text, nullable=False), Column('pid', Integer, nullable=False),
+    Column('started_at', DateTime(timezone=True), nullable=False),
+    Column('heartbeat_at', DateTime(timezone=True), nullable=False),
+    Column('status', String(20), nullable=False), Column('activity', Text, nullable=False),
+    Column('last_error', JSONB), Column('stopped_at', DateTime(timezone=True)),
+)
+
+scheduled_tasks = Table(
+    'scheduled_tasks', Base.metadata,
+    Column('name', String(30), primary_key=True),
+    Column('interval_seconds', Float, nullable=False), Column('next_run_at', DateTime(timezone=True), nullable=False),
+    Column('status', String(20), nullable=False),
+    Column('worker_id', UUID(as_uuid=True), ForeignKey('workers.id')), Column('owner_token', UUID(as_uuid=True)),
+    Column('last_attempt_at', DateTime(timezone=True)), Column('last_success_at', DateTime(timezone=True)),
+    Column('last_attempt_id', UUID(as_uuid=True)), Column('last_success_id', UUID(as_uuid=True)),
+    Column('reconciliation_id', UUID(as_uuid=True), ForeignKey('reconciliations.id')),
+    Column('attempts', Integer, nullable=False, server_default='0'), Column('last_error', JSONB),
+)

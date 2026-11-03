@@ -17,6 +17,14 @@ class Settings(BaseSettings):
     min_longitude: float = Field(default=116, ge=-180, le=180)
     max_longitude: float = Field(default=130, ge=-180, le=180)
 
+    worker_recent_seconds: float = Field(default=300, ge=1, allow_inf_nan=False)
+    worker_reconcile_seconds: float = Field(default=86400, ge=1, allow_inf_nan=False)
+    worker_reconcile_days: int = Field(default=30, ge=1, le=3650)
+    worker_retry_seconds: float = Field(default=300, ge=1, allow_inf_nan=False)
+    worker_heartbeat_seconds: float = Field(default=10, ge=1, allow_inf_nan=False)
+    worker_poll_seconds: float = Field(default=1, ge=0.1, allow_inf_nan=False)
+    recheck_max_ids: int = Field(default=100, ge=1, le=1000)
+
     @model_validator(mode="after")
     def validate_bounds(self):
         if self.min_latitude >= self.max_latitude or self.min_longitude >= self.max_longitude:

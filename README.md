@@ -1,13 +1,13 @@
-# QuakePH — Milestones 1–3
+# QuakePH — Milestones 1–4
 
 A student data engineering project covering **Philippines and surrounding region**
 (4–22° latitude, 116–130° longitude). This configurable rectangle includes nearby
 waters; it is not an exact national boundary.
 
-The foundation, real USGS weekly ingestion, and resumable historical imports are
-implemented. Earthquakes, pipeline attempts, and historical job/window progress
-persist in PostgreSQL. The frontend is still a status shell; maps, search,
-scheduling, and dashboard data APIs are not implemented.
+Recent ingestion, resumable historical imports, scheduled collection, reconciliation,
+and compact revision history are implemented. PostgreSQL persists events, attempts,
+checkpoints, schedules, and worker health. The frontend is still a status shell;
+maps, search, and dashboard data APIs are not implemented.
 No fixtures are inserted into the running application.
 
 ## How the pieces fit
@@ -92,7 +92,7 @@ npm --prefix frontend run lint
   database is down.
 - `/health/ready`: HTTP 200 means a real `SELECT 1` succeeded; HTTP 503 means the
   database is unavailable. It checks connectivity, not migration currency. Use
-  `alembic current` to confirm `69e8baad5d8e (head)` separately.
+  `alembic current` to confirm `8614c6328d6f (head)` separately.
 - The dashboard should say **API and database ready** and show configured bounds.
   Refresh the page after changing server/database state; status is checked on load.
 - To observe the difference, run `docker compose stop db`, check both health URLs,
@@ -239,9 +239,9 @@ retried; malformed successful responses fail without retrying.
 
 Tracking starts and finalizes in separate committed transactions so a data
 rollback cannot erase failure history. If PostgreSQL itself cannot persist
-tracking, the CLI exits 1 and explicitly reports that limitation. A killed
-recent-feed process can still leave a run `running`; historical jobs have the
-explicit lock-based recovery described below.
+tracking, the CLI exits 1 and explicitly reports that limitation. A killed manual
+recent-feed process can still leave a run `running`. Scheduled runs and historical
+jobs have lock-based recovery; the worker never guesses that a manual run is dead.
 Concurrent transactions may fail on lock timeout/deadlock; PostgreSQL preserves
 uniqueness/revision ordering and the run fails rather than claiming success.
 
@@ -397,9 +397,9 @@ Each window attempt has a separate `pipeline_runs` row linked by
 - The shared HTTP policy still uses at most 3 attempts with bounded backoff and
   Retry-After handling, 10-second connect and 30-second other HTTP timeouts.
   Processing stops at the first failed window; later work remains pending.
-- A PostgreSQL advisory transaction lock prevents another executor from running
-  the same job. It is held on a dedicated connection and released on disconnect
-  or process exit. Resume acquires this lock **before** treating earlier running
+- A PostgreSQL advisory session lock prevents another executor from running
+  the same job. Its dedicated connection uses AUTOCOMMIT, so it holds no open DB
+  transaction while waiting for HTTP. It releases on disconnect or process exit. Resume acquires this lock **before** treating earlier running
   windows/attempts as interrupted; it never assumes that a timestamp alone proves
   abandonment. A new ownership token is checked under a job-row lock in every
   write transaction, preventing an old worker from committing after a takeover.
@@ -467,6 +467,231 @@ no rows; no test schemas remained. Controlled failures used test transports and
 isolated PostgreSQL data, not deliberate USGS disruptions or edits to real rows.
 Both dependency lockfiles and the PostgreSQL configuration are unchanged.
 
+## Milestone 4: worker, reconciliation, and revision history
+
+The **worker** runs imports automatically in a separate process from FastAPI.
+**Reconciliation** revisits previously collected data, first by catalog range and
+then by stored event ID. **Revision history** records accepted newer source
+changes in the same transaction as the current earthquake row.
+
+### Start, stop, and configure
+
+From the project root, with PostgreSQL still on host port **55432**:
+
+```sh
+docker compose up -d --wait
+.tools/bin/uv run --directory backend --locked alembic upgrade head
+.tools/bin/uv run --directory backend --locked python -m app.worker
+```
+
+Stop the foreground worker with **Ctrl+C** (SIGINT). To stop it from another
+terminal, run `kill -TERM PID`, replacing `PID` with the numeric process ID printed
+by the worker. SIGINT/SIGTERM set a stop flag; the worker stops at the next safe
+boundary, rolls back an unfinished checkpoint, records failure when it can, and
+releases its session locks. An in-flight HTTP request may take up to its timeout
+to return. Normal requested shutdown exits 0; loss of ownership/DB execution
+failure exits 1. A stopped worker cannot collect data. Local collection also
+pauses while the Mac is asleep; this project installs no system service or
+wake-from-sleep mechanism.
+
+Optional settings are in `.env.example`; add them to the private `.env` as needed:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `WORKER_RECENT_SECONDS` | 300 | Collection interval after completion |
+| `WORKER_RECONCILE_SECONDS` | 86400 | Reconciliation interval after completion |
+| `WORKER_RECONCILE_DAYS` | 30 | Preceding UTC time period to refresh |
+| `WORKER_RETRY_SECONDS` | 300 | Delay before retrying failed/incomplete tasks |
+| `WORKER_HEARTBEAT_SECONDS` | 10 | Independent liveness heartbeat interval |
+| `WORKER_POLL_SECONDS` | 1 | Scheduler polling interval |
+| `RECHECK_MAX_IDS` | 100 | Maximum stored-ID requests per reconciliation pass |
+
+Schedules persist in `scheduled_tasks`. Both tasks are initially due when first
+created. Restarting preserves their next-run times and any reconciliation ID;
+startup applies configured intervals without resetting due times. Run all worker
+instances with the same settings. If a task is overdue, it runs once and schedules
+its next attempt from completion, rather than replaying missed ticks. Work is
+serial: a long reconciliation delays a due recent collection. There are no
+Celery/Redis/Airflow dependencies, no FastAPI scheduler, and no automatic deployment.
+
+The bounded verification option stops after a number of attempted due tasks:
+
+```sh
+WORKER_RECENT_SECONDS=60 .tools/bin/uv run --directory backend --locked python -m app.worker --max-tasks 3
+```
+
+This does not force existing non-due tasks to run. Avoid tiny live intervals;
+controlled tests use a fake clock instead of repeatedly contacting USGS.
+
+### Reconciliation and manual older ranges
+
+Each new scheduled reconciliation freezes exact UTC start/end instants (end is
+current time truncated to milliseconds; start is the configured days earlier).
+It creates a **new** historical job, so a previously completed period does not
+suppress refetching. If it fails or reaches its ID budget, the schedule retains
+that reconciliation ID and resumes its original boundaries/settings on retry.
+Completed catalog windows and ID observations are skipped on resume.
+
+For older ranges, dates still mean UTC midnight with an exclusive end:
+
+```sh
+.tools/bin/uv run --directory backend --locked python -m app.reconcile import --start 2020-01-01 --end 2020-01-08
+.tools/bin/uv run --directory backend --locked python -m app.reconcile resume RECONCILIATION_ID
+```
+
+Replace `RECONCILIATION_ID` with the UUID printed by the import. Completed
+reconciliations report their prior result without refetching; start a new import
+to refresh again. Manual reconciliation exits nonzero for failed/incomplete work.
+
+A box-filtered catalog search cannot reveal an event moved out of that box.
+At reconciliation creation, `reconciliation_events` freezes the IDs of all stored
+rows whose **stored origin time** falls in the requested interval, before any
+catalog writes change those times/locations. After the catalog stage, each ID is
+queried without time/geographic filters using `eventid`, `format=geojson`,
+`includedeleted=true`, and `nodata=404`. The implementation follows the current
+[USGS event-ID/deletion documentation](https://earthquake.usgs.gov/fdsnws/event/1/)
+and verified a live individual-Feature response for an existing stored ID.
+
+- Newer out-of-region revisions remain stored with `coverage_status='outside'`.
+  `coverage_scope` stores the bounds used for that assessment. A moved origin
+  time is also preserved even if it is outside the reconciliation interval.
+- HTTP 404/204 records a `missing` observation, not deletion. HTTP 409 records
+  `unresolved`, since no usable deletion payload was returned. Neither removes
+  or fabricates an earthquake. A completed check can report missing/unresolved
+  observations; success means the check completed, not that every ID was found.
+- An explicit `properties.status='deleted'` Feature with a newer updated time
+  sets `source_state='deleted'` and records a revision. A tombstone may omit
+  geometry; last-known scientific values remain available and its raw JSON is
+  retained. Older deletion/active payloads cannot overwrite newer content.
+- A response under a different canonical ID records `redirected` and `related_id`.
+  The returned event is stored under its real ID. The old row is retained; no
+  irreversible merge or deletion is inferred.
+- Rechecks use the same bounded retries/timeouts as other ingestion. Failed
+  observations retain pipeline errors and retry on resume. At most the saved
+  `RECHECK_MAX_IDS` are attempted per pass; remaining work stays `incomplete`.
+  Catalog requests remain adaptively bounded as described in Milestone 3.
+
+Automatic reconciliation covers a **bounded period**, not the full historical
+catalog. Revisions to older stored events require manual older-range reconciliation.
+It cannot guarantee detection of every deletion, merged ID, event never observed,
+or source change during requests. The source is not a point-in-time snapshot.
+No missing feed/catalog result causes row deletion.
+
+### Locking, recovery, and observability
+
+A database-backed session lock serializes **all scheduled ingestion**, so two
+workers cannot execute overlapping scheduled tasks. Historical jobs and
+reconciliations also have their own per-ID session locks. Connections holding
+these locks use AUTOCOMMIT; there is no database transaction open during HTTP,
+backoff, or idle sleep. Locks release in `finally`, or when the DB session dies.
+Every data/checkpoint transaction checks physical lock ownership and a persisted
+ownership token under a row lock. A stale executor cannot continue writing after
+connection loss or takeover.
+
+Only a newly established lock owner recovers earlier unfinished work. The worker
+recovers the exact scheduled recent-run ID and resumes its saved reconciliation;
+historical jobs recover unfinished attempts after acquiring their job lock.
+Heartbeat age alone is never treated as proof of abandonment. A dead connection
+can take time for PostgreSQL to detect. If the DB is unreachable, recovery and
+heartbeat persistence must wait. Interrupted work is not marked successful.
+
+Manual recent imports and different historical/reconciliation jobs can overlap
+scheduled work. They share version-aware row locking/history, preserving IDs,
+first-seen time, and monotonically advancing last-seen time. Same-job imports
+are refused while their job lock is held. Lock timeout/deadlock errors fail an
+attempt safely rather than claiming success. Manual recent runs without a worker
+owner are not automatically classified as abandoned.
+
+`workers` persists hostname, PID, activity, heartbeat, status, and recent error.
+An independent heartbeat thread stays alive even while upstream requests fail.
+Fresh heartbeat **does not imply ingestion success**: inspect `scheduled_tasks`
+last-attempt/last-success times separately. Older errors remain in pipeline
+attempts/reconciliation observations after recovery.
+
+### Compact revision history
+
+All real ingestion paths pass their pipeline run ID into the same upsert helper.
+Initial inserts establish a baseline and do not create history. For a strictly
+newer USGS updated timestamp, the row is locked and its update/history entry
+commit atomically. A unique event/version constraint prevents duplicate history
+under concurrent attempts. Older/identical versions only advance last-seen and
+coverage observations, not source content or revision history.
+
+Tracked source fields are event time, magnitude/type, place, longitude/latitude,
+depth, review status, event type, URL, and authoritative source state. `changes`
+holds only changed tracked fields with old/new values. Raw JSON is kept on the
+current event, not duplicated in history; untracked raw-product changes are not
+expanded into diffs. If the timestamp advances with no tracked-field changes,
+one history entry with `changes={}` records that source version and the current
+raw JSON is replaced. First-seen stays fixed. Coverage/last-seen/source-check
+observations alone are not source revisions.
+
+Open `psql` using the existing command above, then inspect:
+
+```sql
+SELECT id, hostname, pid, status, activity, heartbeat_at,
+       now() - heartbeat_at AS heartbeat_age,
+       heartbeat_at AT TIME ZONE 'Asia/Manila' AS heartbeat_asia_manila,
+       last_error, stopped_at FROM workers ORDER BY started_at DESC;
+
+SELECT name, status, attempts, interval_seconds, last_attempt_at, last_success_at,
+       next_run_at, last_attempt_id, last_success_id, reconciliation_id, last_error
+FROM scheduled_tasks ORDER BY name;
+-- Attempt/success IDs refer to pipeline_runs for recent, reconciliations for reconcile.
+
+SELECT id, status, start_at, end_at, historical_job_id, last_error
+FROM reconciliations ORDER BY created_at DESC;
+SELECT reconciliation_id, status, count(*) FROM reconciliation_events
+GROUP BY reconciliation_id, status;
+SELECT * FROM reconciliation_events WHERE status IN ('failed','missing','unresolved','redirected');
+
+SELECT usgs_id, coverage_status, coverage_scope, source_state, source_checked_at
+FROM earthquakes ORDER BY event_time DESC LIMIT 20;
+SELECT usgs_id, previous_updated_at, new_updated_at, changes,
+       pipeline_run_id, recorded_at FROM revision_history ORDER BY recorded_at DESC LIMIT 20;
+SELECT id, ingestion_type, status, errors FROM pipeline_runs
+WHERE status <> 'success' ORDER BY started_at DESC LIMIT 20;
+```
+
+### Milestone 4 verification
+
+On **2026-11-03, Asia/Manila (UTC+08:00)**, the online migration reached
+`8614c6328d6f` with no Alembic schema drift. All **89 backend tests passed**,
+including 40 isolated PostgreSQL test cases. The existing non-failing
+Starlette/httpx TestClient deprecation warning remains. Controlled tests cover
+fake-clock schedules/restart/overdue work, two competing workers, session-lock
+release and real termination of only a test-owned DB connection, ownership loss,
+SIGTERM shutdown, abandoned-run recovery, atomic/concurrent history, old versions,
+time-only versions, fresh heartbeats with failed ingestion, reconciliation
+refetch/resume, moved events, deletion evidence, missing IDs, and canonical IDs.
+Tests use disposable schemas; no live rows are edited to simulate revisions.
+
+The real worker `6d7ffbc4-468d-462b-b75b-8d520ad2f981` ran three due tasks with a
+60-second temporary recent interval and then stopped automatically:
+
+| Task | Fetched | In scope | Inserted | Updated | Unchanged |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| First recent collection | 1946 | 13 | 13 | 0 | 0 |
+| Reconciliation catalog (5 completed windows) | 38 | 38 | 20 | 0 | 18 |
+| Reconciliation ID rechecks (18 found) | 18 | 18 | 0 | 0 | 18 |
+| Second recent collection | 1946 | 13 | 0 | 0 | 13 |
+
+Recent collections each excluded 1,890 out-of-region earthquakes and 43 other
+event types. All live attempts succeeded with zero rejected records and zero
+failed request attempts. The reconciliation range was frozen as
+**[2026-10-04T14:10:52.914Z, 2026-11-03T14:10:52.914Z)**, corresponding to
+22:10:52.914 Asia/Manila on those dates. Its ID was
+`cfdd30ea-e9e2-41f2-90d7-f8027bf5bb4a`, historical job
+`32a139d4-6489-49c6-93dc-0dbfd49cafc4`.
+
+Direct SQL confirmed **50 rows and 50 distinct USGS IDs**. There were zero live
+revision-history entries because USGS returned no newer revisions during these
+requests; controlled fixtures proved revision behavior. The default persistent
+interval configuration was restored to 300/86400 seconds without another import.
+Both recorded workers are stopped, and the actual verification PID exited.
+No worker is intentionally left running. Dependency lockfiles, the Compose
+configuration, host port 55432, and all frontend files are unchanged.
+
 ## References and next steps
 
 Official setup references: [FastAPI](https://fastapi.tiangolo.com/deployment/manually/),
@@ -475,6 +700,6 @@ Official setup references: [FastAPI](https://fastapi.tiangolo.com/deployment/man
 USGS sources: [USGS catalog documentation](https://earthquake.usgs.gov/fdsnws/event/1/)
 and [recent all-week GeoJSON](https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson).
 
-Milestone 3 stops at resumable historical imports. Scheduling, dashboard data
-endpoints, and Leaflet map features remain for later milestones.
+Milestone 4 stops at automatic collection, reconciliation, and revision history.
+Dashboard data endpoints and Leaflet map features remain for later milestones.
 Nothing has been pushed or deployed.
