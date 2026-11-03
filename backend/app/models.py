@@ -135,3 +135,12 @@ scheduled_tasks = Table(
     Column('reconciliation_id', UUID(as_uuid=True), ForeignKey('reconciliations.id')),
     Column('attempts', Integer, nullable=False, server_default='0'), Column('last_error', JSONB),
 )
+
+
+# Dashboard query patterns: filtered chronological pages, newest run pages,
+# and latest completed ID observations (used by list/map/detail projections).
+from sqlalchemy import Index
+Index('ix_earthquakes_time_id', earthquakes.c.event_time.desc(), earthquakes.c.usgs_id)
+Index('ix_pipeline_runs_started_id', pipeline_runs.c.started_at.desc(), pipeline_runs.c.id.desc())
+Index('ix_reconciliation_events_latest', reconciliation_events.c.usgs_id,
+      reconciliation_events.c.checked_at.desc(), reconciliation_events.c.reconciliation_id.desc())

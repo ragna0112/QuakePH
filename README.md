@@ -1,13 +1,14 @@
-# QuakePH — Milestones 1–4
+# QuakePH — Milestones 1–5
 
 A student data engineering project covering **Philippines and surrounding region**
 (4–22° latitude, 116–130° longitude). This configurable rectangle includes nearby
 waters; it is not an exact national boundary.
 
 Recent ingestion, resumable historical imports, scheduled collection, reconciliation,
-and compact revision history are implemented. PostgreSQL persists events, attempts,
+and compact revision history are implemented. Read-only dashboard APIs now expose
+stored events, statistics, and pipeline health. PostgreSQL persists events, attempts,
 checkpoints, schedules, and worker health. The frontend is still a status shell;
-maps, search, and dashboard data APIs are not implemented.
+map, table, and chart interfaces are not implemented.
 No fixtures are inserted into the running application.
 
 ## How the pieces fit
@@ -92,7 +93,7 @@ npm --prefix frontend run lint
   database is down.
 - `/health/ready`: HTTP 200 means a real `SELECT 1` succeeded; HTTP 503 means the
   database is unavailable. It checks connectivity, not migration currency. Use
-  `alembic current` to confirm `8614c6328d6f (head)` separately.
+  `alembic current` to confirm `74ef76e7aa5e (head)` separately.
 - The dashboard should say **API and database ready** and show configured bounds.
   Refresh the page after changing server/database state; status is checked on load.
 - To observe the difference, run `docker compose stop db`, check both health URLs,
@@ -692,6 +693,209 @@ Both recorded workers are stopped, and the actual verification PID exited.
 No worker is intentionally left running. Dependency lockfiles, the Compose
 configuration, host port 55432, and all frontend files are unchanged.
 
+## Milestone 5: read-only dashboard API
+
+The future frontend will request JSON from these endpoints instead of fetching
+USGS directly. For example, it can request one table page, the map's limited
+GeoJSON, and full matching statistics using the **same filter values**. Event
+clicks can request details, while status panels can read persisted worker/run
+records. None of these requests imports data, starts a worker, or contacts USGS.
+
+### Start and try it
+
+The existing API command on port 8000 remains valid when that port is free. It
+was occupied by another application during verification, so this exact command
+uses **8001** without disturbing it. PostgreSQL stays on **55432**:
+
+```sh
+docker compose up -d --wait
+.tools/bin/uv run --directory backend --locked alembic upgrade head
+.tools/bin/uv run --directory backend --locked uvicorn app.main:app --host 127.0.0.1 --port 8001
+```
+
+Stop the foreground API server with Ctrl+C. Open <http://127.0.0.1:8001/docs>
+for typed requests, response schemas, descriptions, and interactive examples.
+These examples use the verification port:
+
+```sh
+curl -s 'http://127.0.0.1:8001/api/earthquakes?page=1&page_size=5&sort=time_desc'
+curl -s 'http://127.0.0.1:8001/api/earthquakes/map?limit=5'
+curl -sG 'http://127.0.0.1:8001/api/earthquakes' \
+  --data-urlencode 'start=2020-01-01T00:00:00Z' \
+  --data-urlencode 'end=2020-01-08T00:00:00Z' \
+  --data-urlencode 'place=Mindanao'
+curl -s 'http://127.0.0.1:8001/api/earthquakes/us7000tuv5'
+curl -s 'http://127.0.0.1:8001/api/stats?daily_days=30'
+curl -s 'http://127.0.0.1:8001/api/pipeline/status'
+curl -s 'http://127.0.0.1:8001/api/pipeline/runs?run_type=recent_week&page_size=5'
+curl -s 'http://127.0.0.1:8001/api/pipeline/runs?status=failed'
+```
+
+Use an actual returned event ID for details; unknown IDs return 404. Date filters
+require timezone-aware **datetimes**, unlike the import CLIs' date-only arguments.
+Use `--data-urlencode` for offsets such as `+08:00` so `+` is not decoded as a space.
+The Vite development proxy remains configured for port 8000. When using that
+proxy in future frontend work, run QuakePH on its normal 8000 port; the 8001
+examples above call the API directly. No frontend files changed in this milestone.
+
+### Shared event semantics
+
+All three collection endpoints share `start`, `end`, `min_magnitude`,
+`max_magnitude`, `min_depth`, `max_depth`, `place`, `include_outside`, and
+`include_deleted`. Applied filters are returned in the response, with supplied
+instants normalized to UTC. Event timestamps are serialized with UTC offsets
+(normally `Z`). Geographic metadata always uses the configured box and its
+**Philippines and surrounding region** label, not a national boundary.
+
+- Time is **inclusive start, exclusive end**. A supplied start/end pair must
+  satisfy start < end. Missing bounds leave that side unbounded; date-only or
+  timezone-naive values are rejected with 422.
+- Numeric bounds are inclusive, must be finite, and allow negative magnitude
+  and depth. Equal numeric bounds are valid; reversed ones are not. Null
+  magnitudes remain when there is no magnitude filter, and are excluded by any
+  magnitude comparison. Stored depth is currently required by ingestion/schema.
+- `place` is a trimmed, case-insensitive **literal substring**, up to 200
+  characters. `%`, `_`, quotes, and SQL-looking text do not become SQL/wildcards.
+  Null places are included with no place filter and cannot match a text filter.
+- Only records currently typed `earthquake` participate in list/map/stats.
+  Default coverage uses **current coordinates against current configured bounds**,
+  not a potentially stale stored coverage label. `include_outside=true` includes
+  moved-outside rows; it does not fetch any new events.
+- Explicit `source_state='deleted'` rows are excluded unless
+  `include_deleted=true`. Missing/unresolved checks do not prove deletion, so
+  their last-known active rows remain eligible. Each summary includes its latest
+  completed source-observation status when available. These observations and
+  authoritative source state can differ, particularly with an older tombstone.
+- Direct detail lookup bypasses event-type, coverage, and source-state filters.
+  `coverage_status` is computed using current API bounds; the separately named
+  `recorded_coverage_status` is the cached label from ingestion/reconciliation.
+  Source state remains the last authoritative state, not a guarantee of current
+  upstream availability. Unexpected/non-public source URLs are omitted.
+
+### Endpoints and bounds
+
+| Endpoint | Response and limits |
+| --- | --- |
+| `GET /api/earthquakes` | Summaries, total, applied filters, sort, coverage, pagination. Defaults: page 1, page_size 25; maximum page_size 100 and page 100000. Pages beyond the last are empty. |
+| `GET /api/earthquakes/{event_id}` | Stored detail, source URL, event/source/collection times, current coverage/source state. Newest 20 revisions with total/returned/limit/truncated metadata. No raw source JSON. |
+| `GET /api/earthquakes/map` | GeoJSON FeatureCollection; coordinates are **[longitude, latitude]**, depth is a property. Default limit 1000, maximum 5000. Metadata includes total/returned/truncated. Static route has precedence over the ID route. |
+| `GET /api/stats` | Full matching count, strongest, latest, and a bounded Manila daily chart. No list/map pagination affects totals. |
+| `GET /api/pipeline/status` | Worker freshness/activity, task attempt/success IDs and times, due times, reconciliation scope, lock evidence, and recent failures. At most 10 workers and 10 failed/partial attempts, with truncation flags. |
+| `GET /api/pipeline/runs` | Attempt summaries, counters, IDs linking windows/jobs/reconciliations, and safe error summaries. Same pagination bounds as the event list. |
+
+Event sorts are `time_desc` (default), `time_asc`, `magnitude_desc`,
+`magnitude_asc`, `depth_asc`, `depth_desc`, and `updated_desc`. Every sort uses
+USGS ID ascending as a deterministic tie-breaker; numeric nulls sort last.
+Map selection is always `time_desc`. Run pages are newest-started first, then
+run UUID descending for ties. Run filters are `run_type` (`recent_week`,
+`historical_window`, `reconcile_event`) and `status` (`running`, `success`,
+`partial`, `failed`). These are **attempts**, not summed job-progress totals.
+
+Stats strongest excludes null magnitudes and breaks magnitude ties by latest
+event time, then ID ascending. Latest uses event time descending, ID ascending.
+No matching events gives count 0 and null strongest/latest. If only null
+magnitudes match, strongest alone is null.
+
+Daily buckets use **Asia/Manila calendar days**, after applying the requested
+UTC instant filters. First/last buckets can therefore cover partial days.
+`daily_days` defaults to 30 and is capped at 366. The final chart day is the
+Manila date of exclusive end minus one microsecond, if supplied; otherwise it is
+the latest matching event's Manila day. An empty result anchors to today (or a
+future requested start). The first chart day respects the requested start and
+maximum day count. Zero days are filled across that bounded chart window.
+
+The chart is deliberately distinct from full totals: `events_outside_chart`
+counts matching rows older than its chart window, and `truncated` flags that
+situation. Count/strongest/latest always cover **all matching rows**, including
+those outside the chart. `coverage_verified=false` and a response note explicitly
+state that zero stored events does **not** prove a fully imported source period.
+Neither gaps between backfills nor unimported dates become verified zero-event days.
+
+### Pipeline status is evidence, not a worker controller
+
+`worker_state` is `not_observed` if no worker rows exist, `alive` for a recorded
+running worker with a fresh heartbeat, `stale` for running records without fresh
+heartbeats, or `stopped` when none is recorded running. Freshness defaults to
+30 seconds (`API_WORKER_FRESH_SECONDS`). A recent stopped heartbeat is not an
+alive worker; a fresh running heartbeat is not proof of successful collection.
+Worker UUIDs are public identity; unnecessary local host/process paths are omitted.
+
+Task records expose last attempted and successful IDs/times separately. IDs
+refer to pipeline runs for `recent`, reconciliations for `reconcile`. A successful
+record can still have an overdue next schedule if its worker is stopped. The
+response explicitly sets `scheduled_time_is_guarantee=false`.
+
+`recorded_running` never becomes a confirmed owner merely from a persisted
+status or heartbeat. `scheduled_lock_held` reads current-database advisory-lock
+catalog evidence without acquiring a lock, but existing scheduling metadata does
+not bind a lock backend PID to its stored owner token. Thus
+`owner_confirmation='not_verified'`, even when that lock is held. The API neither
+claims a specific active owner nor tries to recover/restart anything. Run rows
+can likewise stay recorded running after an interruption.
+
+Errors expose only safe categories, allowlisted exception names, HTTP status,
+attempt number, and record index. Arbitrary exception messages, nested outcomes,
+connection strings, raw traces, local paths, raw scope/settings JSON, and source
+payloads are excluded. Each attempt exposes at most three error summaries, with
+recorded-count/truncation metadata; full local diagnostics remain in CLI/database
+tracking for local inspection.
+
+### Database and browser behavior
+
+Each new endpoint uses a short PostgreSQL **READ ONLY, REPEATABLE READ**
+transaction. Counts and returned rows use one snapshot even while the worker
+commits elsewhere. Separate requests/pages can still see later changes; this is
+not a cross-request source snapshot. SQL values are bound parameters and sorts
+are allowlisted. SQLAlchemy database failures return a generic 503; liveness and
+readiness keep their existing distinct behavior.
+
+Migration `74ef76e7aa5e` adds only three query-driven indexes: earthquake
+time/ID for chronological pages and time bounds, run start/ID for stable newest
+pages, and stored-ID/check-time ordering for latest observations. No spatial,
+trigram, or speculative indexing dependencies were added. Small tables may still
+use PostgreSQL sequential scans; no speed claim depends on these 50 live rows.
+
+Browser origins are configured as a JSON list in the private `.env`:
+
+```dotenv
+FRONTEND_ORIGINS=["http://127.0.0.1:5174","http://localhost:5174"]
+API_WORKER_FRESH_SECONDS=30
+```
+
+CORS allows GET with explicit origins and no browser credentials. It does not
+add authentication. This remains a local, loopback-bound application. Existing
+import/worker commands and both dependency lockfiles are unchanged.
+
+### Milestone 5 verification
+
+Executed on **2026-11-03, Asia/Manila (UTC+08:00)**:
+
+- **135 backend tests passed**, including 85 isolated PostgreSQL test cases.
+  The existing Starlette/httpx TestClient warning remains non-failing. Tests
+  cover shared filters, UTC boundaries/Manila midnight, null/negative values,
+  validation, stable ties/pages, map truncation/precedence, bounded history,
+  coordinate changes, no-worker/fresh/stale/failure states, safe error projection,
+  no ingestion side effects, CORS, and real concurrent-write snapshot consistency.
+- Online migration reached `74ef76e7aa5e`; `alembic check` found no schema drift.
+  Existing frontend production build and lint both passed; frontend files changed
+  neither behavior nor content.
+- Actual HTTP calls on port 8001: list total **50**, 5 rows returned; limited map
+  total **50**, 5 features, truncated true; full stats count **50**, chart **38**
+  events and **12** outside the 30-day chart. Strongest was `us7000ttw3`, M5.8.
+- Detail `us7000tuv5` returned active/inside, zero revisions, and no raw JSON.
+  UTC `[2020-01-01, 2020-01-08)` stats matched **12** stored events.
+- Run history total **42**, 5 returned in the requested page. Status reported
+  **2 stopped workers**, no held schedule lock, and **1** recent failed attempt.
+  The recent task was overdue; next execution was correctly not guaranteed.
+- Both health URLs returned 200; unknown ID returned 404; invalid/NaN parameters
+  returned 422; POST on the list returned 405. Live event/run/worker/reconciliation
+  row counts were identical before and after the requests: **50/42/2/1**.
+
+The verification API process was stopped after checks. No QuakePH API or worker
+is intentionally left running; PostgreSQL remains running. No USGS requests or
+imports were made by these API checks. No frontend map, charts, or dashboard
+components were added; nothing was pushed or deployed.
+
 ## References and next steps
 
 Official setup references: [FastAPI](https://fastapi.tiangolo.com/deployment/manually/),
@@ -700,6 +904,6 @@ Official setup references: [FastAPI](https://fastapi.tiangolo.com/deployment/man
 USGS sources: [USGS catalog documentation](https://earthquake.usgs.gov/fdsnws/event/1/)
 and [recent all-week GeoJSON](https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson).
 
-Milestone 4 stops at automatic collection, reconciliation, and revision history.
-Dashboard data endpoints and Leaflet map features remain for later milestones.
+Milestone 5 stops at read-only dashboard APIs. The dashboard frontend, charts,
+and Leaflet map interface remain for later milestones.
 Nothing has been pushed or deployed.
