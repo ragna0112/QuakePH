@@ -1,4 +1,4 @@
-# QuakePH — Milestones 1–5
+# QuakePH — Milestones 1–6
 
 A student data engineering project covering **Philippines and surrounding region**
 (4–22° latitude, 116–130° longitude). This configurable rectangle includes nearby
@@ -7,8 +7,8 @@ waters; it is not an exact national boundary.
 Recent ingestion, resumable historical imports, scheduled collection, reconciliation,
 and compact revision history are implemented. Read-only dashboard APIs now expose
 stored events, statistics, and pipeline health. PostgreSQL persists events, attempts,
-checkpoints, schedules, and worker health. The frontend is still a status shell;
-map, table, and chart interfaces are not implemented.
+checkpoints, schedules, and worker health. The responsive dashboard adds a Leaflet
+map, searchable event table, daily chart, event details, and pipeline observations.
 No fixtures are inserted into the running application.
 
 ## How the pieces fit
@@ -17,12 +17,12 @@ No fixtures are inserted into the running application.
 - `backend/alembic/`: Alembic tracks database schema versions. The baseline revision
   is followed by earthquake storage, pipeline runs, and historical job/window tables.
 - `backend/tests/`: pytest checks health behavior and configuration validation.
-- `frontend/`: React + TypeScript + Vite displays the application shell and API status.
+- `frontend/`: React + TypeScript + Vite displays the interactive read-only dashboard.
   Vite forwards `/api` and `/health` requests to the backend during development.
 - `compose.yaml`: runs PostgreSQL 17 with a persistent local Docker volume.
 
 PostgreSQL connections use UTC. All event and run timestamps use timezone-aware
-`TIMESTAMP WITH TIME ZONE` columns. The shell formats its check time explicitly in
+`TIMESTAMP WITH TIME ZONE` columns. The dashboard formats event and observation times explicitly in
 Asia/Manila (UTC+08:00). Database credentials stay on the backend.
 
 ## Setup (macOS/Linux)
@@ -62,7 +62,7 @@ docker compose up -d --wait
 In terminal 1, from the project root:
 
 ```sh
-.tools/bin/uv run --directory backend --locked uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+.tools/bin/uv run --directory backend --locked uvicorn app.main:app --reload --host 127.0.0.1 --port 8001
 ```
 
 In terminal 2, from the project root:
@@ -71,17 +71,17 @@ In terminal 2, from the project root:
 npm --prefix frontend run dev
 ```
 
-Open <http://127.0.0.1:5174> and API docs at <http://127.0.0.1:8000/docs>.
+Open <http://127.0.0.1:5174> and API docs at <http://127.0.0.1:8001/docs>.
 Port 5174 is intentional because 5173 was already occupied on the development
-machine. If 8000 or 5174 is occupied, stop the relevant process or update the Vite
+machine. Port 8001 avoids another application on 8000. If 8001 or 5174 is occupied, stop the relevant process or update the Vite
 port/proxy configuration consistently. `npm run preview` only previews static
 build output and does not provide the development API proxy.
 
 ## Check it works
 
 ```sh
-curl -i http://127.0.0.1:8000/health/live
-curl -i http://127.0.0.1:8000/health/ready
+curl -i http://127.0.0.1:8001/health/live
+curl -i http://127.0.0.1:8001/health/ready
 curl -s http://127.0.0.1:5174/api/config
 docker compose ps
 .tools/bin/uv run --directory backend --locked pytest
@@ -94,8 +94,9 @@ npm --prefix frontend run lint
 - `/health/ready`: HTTP 200 means a real `SELECT 1` succeeded; HTTP 503 means the
   database is unavailable. It checks connectivity, not migration currency. Use
   `alembic current` to confirm `74ef76e7aa5e (head)` separately.
-- The dashboard should say **API and database ready** and show configured bounds.
-  Refresh the page after changing server/database state; status is checked on load.
+- The dashboard shows stored records for the latest seven Philippine calendar days.
+  Empty dates are valid. Use **Refresh view** to reload stored data and pipeline status.
+  Database readiness is checked separately through `/health/ready`.
 - To observe the difference, run `docker compose stop db`, check both health URLs,
   then run `docker compose up -d --wait` and refresh the browser.
 
@@ -734,9 +735,8 @@ curl -s 'http://127.0.0.1:8001/api/pipeline/runs?status=failed'
 Use an actual returned event ID for details; unknown IDs return 404. Date filters
 require timezone-aware **datetimes**, unlike the import CLIs' date-only arguments.
 Use `--data-urlencode` for offsets such as `+08:00` so `+` is not decoded as a space.
-The Vite development proxy remains configured for port 8000. When using that
-proxy in future frontend work, run QuakePH on its normal 8000 port; the 8001
-examples above call the API directly. No frontend files changed in this milestone.
+At Milestone 5 the proxy used port 8000. Milestone 6 now forwards both `/api`
+and `/health` to **127.0.0.1:8001**. No frontend files changed in Milestone 5.
 
 ### Shared event semantics
 
@@ -904,6 +904,161 @@ Official setup references: [FastAPI](https://fastapi.tiangolo.com/deployment/man
 USGS sources: [USGS catalog documentation](https://earthquake.usgs.gov/fdsnws/event/1/)
 and [recent all-week GeoJSON](https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson).
 
-Milestone 5 stops at read-only dashboard APIs. The dashboard frontend, charts,
-and Leaflet map interface remain for later milestones.
+Milestone 6 completes the interactive dashboard. The final portfolio/documentation
+milestone has not been started.
 Nothing has been pushed or deployed.
+
+
+## Milestone 6: interactive dashboard
+
+Start from the project root with Docker Engine running. Preserve the private root
+`.env` and PostgreSQL host port **55432**:
+
+```sh
+docker compose up -d --wait
+.tools/bin/uv sync --directory backend --locked
+.tools/bin/uv run --directory backend --locked alembic upgrade head
+npm --prefix frontend ci
+```
+
+Terminal 1:
+
+```sh
+.tools/bin/uv run --directory backend --locked uvicorn app.main:app --host 127.0.0.1 --port 8001
+```
+
+Terminal 2:
+
+```sh
+npm --prefix frontend run dev
+```
+
+Open [QuakePH](http://127.0.0.1:5174) or
+[API documentation](http://127.0.0.1:8001/docs). Existing ingestion/worker commands
+above are unchanged. Opening the dashboard or pressing **Refresh view** only
+reads PostgreSQL; it never imports earthquakes or starts a worker.
+
+### Configuration and behavior
+
+Vite proxies `/api` and `/health` to port **8001**. No frontend environment file
+is needed for local development. Optional public settings are documented in
+`frontend/.env.example`; copy it to ignored `frontend/.env.local` and restart Vite
+if changing them. `VITE_API_BASE_URL` selects a backend origin instead of the
+proxy (a separate origin also requires backend CORS configuration). Never put
+credentials in any `VITE_*` variable. Static preview does not provide the dev proxy.
+
+The default range is the latest seven **Asia/Manila calendar days**, including
+today. UI end dates are inclusive: Nov 5 becomes the API exclusive boundary at
+Nov 6 Manila midnight. Conversion uses the named timezone, independently of the
+browser timezone. Negative finite magnitudes/depths are allowed; reversed dates,
+invalid numbers, and reversed numeric ranges are rejected before requests.
+
+Edit filters, then select **Apply filters**. The frontend validates them, converts
+calendar dates into UTC instants, and sends the same scientific filters to list,
+map, and statistics endpoints. Each panel updates from its own typed response.
+Sorting and pagination affect the table; changing filters resets its page.
+Applied values, sorting, and page are saved in the URL, so reload, copied links,
+and back/forward restore them. Reset restores the default seven days. Empty
+results stay empty; dates are never silently changed to locate stored events.
+
+Requests are cancelled/ignored when obsolete. Panels fail independently. Cached
+responses can remain visible after a failed refresh **only for the same request**,
+with an error and original browser-fetch time. Results from different filters
+are hidden while their replacements load. Separate endpoints do not share a
+transaction snapshot. Browser fetch time is separate from successful collection
+time; stopped/stale workers are never presented as live collection.
+
+Map markers use actual backend GeoJSON. Keyboard users can open a marker with
+Enter/Space or skip to the event list. Zoom/pan survive refresh; **Reset view**
+restores the regional view and **Fit results** fits returned markers. The map
+states returned/total counts and truncation; the paginated list remains available.
+Event dialogs support Escape, focus containment/restoration, source links, and
+bounded revision history. Unknown values have explicit labels.
+
+Statistics come from the full matching database query, never from one table page
+or bounded map. Daily counts show their actual Philippine date range and exact
+values in an expandable table. The API chart is capped at 366 days; excluded
+results and truncation are stated. Zero stored events does not prove that no
+earthquakes occurred or that ingestion covered that day.
+
+The expandable pipeline panel reads recorded heartbeats, successful versus
+attempted collection, reconciliation scope, scheduled next runs, counters, and
+failures. Recorded activity does not prove a process still owns work.
+
+### Map provider
+
+Leaflet uses standard OpenStreetMap raster tiles over HTTPS, with visible
+**© OpenStreetMap contributors** attribution and its copyright link. The
+[current official tile policy](https://operations.osmfoundation.org/policies/tiles/)
+was checked on November 5, 2026. Browser requests use normal browser identification,
+referrer, and HTTP caching; there is no bulk download, offline feature, custom
+cache bypass, or prefetch. The service is best effort, with no availability
+promise. Tile errors show a retry notice without hiding earthquake records.
+`VITE_TILE_URL` and `VITE_TILE_ATTRIBUTION` allow a different provider; comply with
+that provider's policy and attribution. Do not suppress referrers or disable tile
+caching in a published version.
+
+### Actual dashboard screenshots
+
+Captured from the running application and real stored USGS records, November 5,
+2026 (Asia/Manila). These are full-page captures at desktop/mobile viewport widths, not design mocks.
+
+![Desktop dashboard](docs/screenshots/dashboard-desktop.png)
+
+<img src="docs/screenshots/dashboard-mobile.png" alt="Mobile dashboard with collapsed filters and summary cards" width="390" />
+
+### Milestone 6 verification record
+
+Executed November 5, 2026:
+
+- **29 frontend tests passed**, then the same **29 passed with
+  `TZ=America/New_York`**. Tests cover date/month/year boundaries, URL navigation,
+  pagination resets, obsolete requests, independent failures, cached errors,
+  map markers/tile failure, map/chart bounds, worker states, and dialog behavior.
+- Type checking, lint, and production build passed. No backend source, migrations,
+  backend lockfile, ingestion behavior, or worker behavior changed, so backend
+  regression tests were not rerun for this frontend-only milestone.
+- Real backend browser checks at desktop 1440×900 and mobile 390×844 passed;
+  additional 320-pixel-wide layout had no page-wide horizontal overflow.
+- Default Oct 30–Nov 5 showed **5** stored matching earthquakes. Expanding to
+  Oct 4–Nov 5 showed **38**, and minimum magnitude 5 returned **9**. Place search
+  `zzzz-no-stored-match` returned **0** without changing dates. Reset restored 5.
+  Mobile `Basco` search returned **2**.
+- Sorting, list pagination, back/forward, reload, marker keyboard popup, real
+  event details, Escape/focus restoration and focus containment, chart values,
+  pipeline disclosure and attempt pagination were exercised. A zoomed map kept
+  its zoom after Refresh view. USGS source URLs were inspected and the link
+  control clicked; the in-app browser did not expose a new external tab, so
+  destination-page rendering was **not verified**.
+- Browser console reported no warnings/errors. Visible OSM tile images loaded
+  with no failed images. API success was checked through populated panels;
+  a full browser network trace was not available from the automation surface.
+- Controlled frontend tests exercised HTTP failures, stale same-filter cache,
+  obsolete responses, and tile failure. Browser-level offline interception was
+  unavailable. Non-Manila timezone behavior was executed in the test runner,
+  not by changing the actual browser's timezone. Physical mobile devices and
+  screen-reader software were not tested.
+- Read-only SQL after browser checks still found **50 earthquakes and 42 runs**,
+  matching the pre-check counts. No ingestion or worker was started; no fixtures
+  entered the application database. No push or deployment was performed.
+
+Repeat checks:
+
+```sh
+npm --prefix frontend run test
+npm --prefix frontend run test:other-tz
+npm --prefix frontend run typecheck
+npm --prefix frontend run lint
+npm --prefix frontend run build
+curl -i http://127.0.0.1:8001/health/ready
+```
+
+Known limits: independent API snapshots, bounded map/history/chart responses,
+external tile availability, and a local-development proxy rather than a deployed
+hosting configuration. Data freshness depends on separately running the existing
+collector. This is an educational project, not an official earthquake alert
+service. The dashboard does not schedule work or offer write controls.
+
+At handoff the API on **8001**, Vite on **5174**, and PostgreSQL on **55432** remain
+running for local review. No QuakePH worker runs. Stop the API/Vite terminals with
+Ctrl+C when finished; retain the database volume. Milestone 6 stops here.
