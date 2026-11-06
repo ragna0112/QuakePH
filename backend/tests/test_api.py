@@ -297,3 +297,15 @@ def test_openapi_and_origin_configuration():
     for origin in ['*', 'postgresql://secret@host', 'https://example.com/private', 'https://user:secret@example.com']:
         with pytest.raises(ValidationError):
             Settings(_env_file=None, frontend_origins=[origin])
+
+
+def test_one_shot_recent_collection_visible_without_worker(dashboard, pg_engine):
+    identifier = uuid4()
+    with pg_engine.begin() as conn:
+        conn.execute(runs.insert().values(id=identifier, ingestion_type='recent_week', status='success',
+            started_at=NOW-timedelta(seconds=10), ended_at=NOW, source='fixture', scope={}, errors=[]))
+    result = dashboard.get('/api/pipeline/status').json()
+    assert result['worker_state'] == 'not_observed'
+    assert result['tasks'] == []
+    assert datetime.fromisoformat(result['recent_success_at'].replace('Z', '+00:00')) == NOW
+    assert datetime.fromisoformat(result['recent_attempt_at'].replace('Z', '+00:00')) == NOW-timedelta(seconds=10)

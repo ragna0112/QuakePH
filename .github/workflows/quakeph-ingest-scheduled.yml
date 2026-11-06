@@ -1,0 +1,37 @@
+name: QuakePH — scheduled recent ingestion (disabled by default)
+on:
+  workflow_dispatch:
+  # Enable ONLY after manual migration/import/public verification succeeds:
+  # schedule:
+  #   - cron: '17 */6 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: quakeph-production-database
+  cancel-in-progress: false
+jobs:
+  recent:
+    if: github.ref == 'refs/heads/main' && vars.QUAKEPH_SCHEDULE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: quakeph-production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: '0.13.6'
+          enable-cache: false
+      - name: Install locked Python runtime dependencies
+        run: uv sync --directory backend --locked --no-dev --python 3.12
+      - name: Perform QuakePH operation
+        env:
+          DATABASE_URL: ${{ secrets.QUAKEPH_DATABASE_URL_DIRECT }}
+          DATABASE_POOL_MODE: queue
+          DATABASE_CONNECT_TIMEOUT: '10'
+          MIN_LATITUDE: '4'
+          MAX_LATITUDE: '22'
+          MIN_LONGITUDE: '116'
+          MAX_LONGITUDE: '130'
+        run: uv run --directory backend --locked --no-dev python -m app.hosted recent

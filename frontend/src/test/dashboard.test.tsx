@@ -77,3 +77,13 @@ it('renders bounded chart and worker state semantics as text',()=>{
   expect(screen.getByText(/execution ownership is not confirmed/)).toBeTruthy()
   expect(screen.getByText('Daily counts table')).toBeTruthy()
 })
+it('shows one-shot collection success without claiming a live worker',async()=>{
+  vi.stubGlobal('fetch',vi.fn((path:string)=>Promise.resolve(ok(path==='/api/pipeline/status'
+    ?{...status,tasks:[],worker_state:'not_observed',workers:[],recent_success_at:'2026-11-05T12:08:00Z',recent_attempt_at:'2026-11-05T12:07:00Z'}
+    :serve(path)))))
+  render(<App/>)
+  await screen.findByRole('button',{name:'Test trench'})
+  await screen.findAllByText('Worker never observed')
+  expect(screen.getAllByText('Nov 5, 2026, 8:08 PM PHT').length).toBeGreaterThan(0)
+  expect(screen.queryByText('Fresh worker heartbeat')).toBeNull()
+})

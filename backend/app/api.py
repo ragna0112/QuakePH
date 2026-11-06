@@ -329,7 +329,11 @@ def pipeline_status(conn: Read):
             reconciliation_scope=scope, error=safe_error(row['last_error']) if row['last_error'] else None))
     failures = conn.execute(run_query().where(runs.c.status.in_(['failed', 'partial']))
         .order_by(runs.c.started_at.desc(), runs.c.id.desc()).limit(FAILURE_LIMIT+1)).mappings().all()
+    recent_attempt = conn.execute(select(func.max(runs.c.started_at)).where(runs.c.ingestion_type == 'recent_week')).scalar_one()
+    recent_success = conn.execute(select(func.max(runs.c.ended_at)).where(
+        runs.c.ingestion_type == 'recent_week', runs.c.status == 'success')).scalar_one()
     return m.PipelineStatus(observed_at=now, worker_state='not_observed' if total == 0 else 'alive' if alive else 'stale' if running else 'stopped',
+        recent_attempt_at=recent_attempt, recent_success_at=recent_success,
         freshness_seconds=freshness, workers=states, workers_total=total, workers_truncated=total > len(states),
         scheduled_lock_held=scheduled_lock_held(conn), tasks=task_states, recent_failures=[run_summary(row) for row in failures[:FAILURE_LIMIT]],
         failures_limit=FAILURE_LIMIT, failures_truncated=len(failures) > FAILURE_LIMIT)

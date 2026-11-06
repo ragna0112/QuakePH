@@ -300,6 +300,8 @@ class TaskState(BaseModel):
 
 
 class PipelineStatus(BaseModel):
+    recent_attempt_at: AwareDatetime | None = None
+    recent_success_at: AwareDatetime | None = None
     observed_at: AwareDatetime
     worker_state: Literal['not_observed', 'alive', 'stale', 'stopped']
     freshness_seconds: int

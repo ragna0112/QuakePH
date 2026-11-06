@@ -11,3 +11,4 @@ dist/
 *.tsbuildinfo
 .DS_Store
 .tools/
+.vercel/

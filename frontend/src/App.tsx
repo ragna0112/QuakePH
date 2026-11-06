@@ -21,7 +21,7 @@ export default function App() {
   const stats=useResource<Statistics>(urls.stats,refresh)
   const status=useResource<PipelineStatus>('/api/pipeline/status',refresh)
   const runs=useResource<RunList>(`/api/pipeline/runs?page=${runPage}&page_size=5`,refresh)
-  const lastCollection=status.data?.tasks.find(task=>task.name==='recent')?.last_success_at
+  const lastCollection=status.data?.recent_success_at ?? status.data?.tasks.find(task=>task.name==='recent')?.last_success_at
   const data=stats.data
   function change(next:typeof view) {setSelected(null);navigate(next)}
   return <><a className="skip-link" href="#dashboard-content">Skip to dashboard</a>
