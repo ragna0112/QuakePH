@@ -37,6 +37,14 @@ flowchart LR
 | Docker Compose | Local PostgreSQL with a persistent named volume |
 | pytest + Vitest | Backend/PostgreSQL and frontend regression checks |
 
+## Hosting preparation
+
+Local configuration for one Vercel Services project (Vite at `/`, FastAPI at
+`/api`), a separate Neon database, and disabled-by-default GitHub Actions
+collection is ready. See [exact deployment checklist](docs/DEPLOYMENT.md).
+No public deployment or cloud database migration has been verified. Local setup
+and the standalone worker remain available below.
+
 ## Local installation
 
 Use Docker Desktop with **Engine running**, Python 3.9+ for bootstrapping uv,
@@ -273,4 +281,6 @@ confirms its inherited proxy behavior. Both policies were checked November 5, 20
 Read the [student walkthrough](docs/WALKTHROUGH.md),
 [portfolio wording](docs/PORTFOLIO.md), and
 [historical milestone records](docs/MILESTONE_HISTORY.md).
-Milestones 1–7 are complete locally. Nothing has been pushed or deployed.
+Milestones 1–7 are complete locally. Hosting preparation is documented separately;
+repository handoff may be pushed separately, while Git-triggered Vercel deployments
+remain disabled until explicitly authorized.

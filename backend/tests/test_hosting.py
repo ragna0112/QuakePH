@@ -88,3 +88,36 @@ def test_service_routing_preserves_api_and_homepage():
     assert routes[1] == {'source': '/api/:path*', 'destination': {'service': 'backend'}}
     assert routes[-1] == {'source': '/:path*', 'destination': {'service': 'frontend'}}
     assert all('path' not in route['destination'] for route in routes)
+
+
+def test_hosted_import_checks_migration_head_before_source_request(monkeypatch, capsys):
+    monkeypatch.setattr(hosted, 'get_settings', lambda: Mock())
+    monkeypatch.setattr(hosted, 'validate_target', lambda settings: None)
+    engine = Mock()
+    engine.connect.return_value = nullcontext(Mock())
+    monkeypatch.setattr(hosted, 'get_engine', lambda: engine)
+    monkeypatch.setattr(hosted, 'session_lock', lambda *args: nullcontext())
+    monkeypatch.setattr(hosted.MigrationContext, 'configure', lambda connection: Mock(get_current_heads=lambda: ('old',)))
+    monkeypatch.setattr(hosted.ScriptDirectory, 'from_config', lambda config: Mock(get_heads=lambda: ('new',)))
+    ingestion = Mock()
+    monkeypatch.setattr(hosted, 'ingest', ingestion)
+    assert hosted.run('recent') == 1
+    ingestion.assert_not_called()
+    assert json.loads(capsys.readouterr().out)['reason'] == 'RuntimeError'
+
+
+def test_hosted_partial_import_exits_nonzero_and_omits_raw_errors(monkeypatch, capsys):
+    monkeypatch.setattr(hosted, 'get_settings', lambda: Mock())
+    monkeypatch.setattr(hosted, 'validate_target', lambda settings: None)
+    engine = Mock()
+    engine.connect.return_value = nullcontext(Mock())
+    monkeypatch.setattr(hosted, 'get_engine', lambda: engine)
+    monkeypatch.setattr(hosted, 'session_lock', lambda *args: nullcontext())
+    monkeypatch.setattr(hosted.MigrationContext, 'configure', lambda connection: Mock(get_current_heads=lambda: ('head',)))
+    monkeypatch.setattr(hosted.ScriptDirectory, 'from_config', lambda config: Mock(get_heads=lambda: ('head',)))
+    monkeypatch.setattr(hosted.httpx, 'Client', lambda **kwargs: nullcontext(Mock()))
+    monkeypatch.setattr(hosted, 'ingest', lambda *args: {'status': 'partial', 'rejected': 1, 'errors': ['secret']})
+    assert hosted.run('recent') == 1
+    output = capsys.readouterr().out
+    assert 'secret' not in output
+    assert json.loads(output)['rejected'] == 1

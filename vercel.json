@@ -1,24 +1,65 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "builds": [
+  "services": {
+    "frontend": {
+      "root": "frontend",
+      "framework": "vite",
+      "installCommand": "npm ci",
+      "buildCommand": "npm run build",
+      "outputDirectory": "dist"
+    },
+    "backend": {
+      "root": "backend",
+      "framework": "fastapi",
+      "entrypoint": "app.main:app",
+      "functions": {
+        "app/main.py": {
+          "maxDuration": 30,
+          "excludeFiles": "{tests/**,.venv/**,.env,.env.*,__pycache__/**}"
+        }
+      },
+      "buildCommand": "python -c \"from app.main import app; assert app.title == 'QuakePH'\""
+    }
+  },
+  "rewrites": [
     {
-      "src": "frontend/package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "distDir": "dist"
+      "source": "/api",
+      "destination": {
+        "service": "backend"
       }
     },
     {
-      "src": "backend/app/hosted.py",
-      "use": "@vercel/python"
+      "source": "/api/:path*",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/health/:path*",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/docs",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/openapi.json",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/:path*",
+      "destination": {
+        "service": "frontend"
+      }
     }
   ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "backend/app/hosted.py" },
-    { "src": "/health/(.*)", "dest": "backend/app/hosted.py" },
-    { "src": "/docs", "dest": "backend/app/hosted.py" },
-    { "src": "/openapi.json", "dest": "backend/app/hosted.py" },
-    { "handle": "filesystem" },
-    { "src": "/(.*)", "dest": "frontend/$1" }
-  ]
+  "git": {
+    "deploymentEnabled": false
+  }
 }
