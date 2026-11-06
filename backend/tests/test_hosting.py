@@ -87,7 +87,8 @@ def test_service_routing_preserves_api_and_homepage():
     assert routes[0] == {'source': '/api', 'destination': {'service': 'backend'}}
     assert routes[1] == {'source': '/api/:path*', 'destination': {'service': 'backend'}}
     assert routes[-1] == {'source': '/:path*', 'destination': {'service': 'frontend'}}
-    assert all('path' not in route['destination'] for route in routes)
+    assert routes[-2] == {'source': '/', 'destination': {'service': 'frontend', 'path': '/index.html'}}
+    assert all('path' not in route['destination'] for route in routes if route['source'] != '/')
 
 
 def test_hosted_import_checks_migration_head_before_source_request(monkeypatch, capsys):
