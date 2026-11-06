@@ -298,3 +298,40 @@ Migration workflow: **QuakePH — migrate database**
 required string input **confirmation = quakeph**. It uses environment
 **quakeph-production**, secret **QUAKEPH_DATABASE_URL_DIRECT**. Creating the database
 and adding that secret do not themselves apply migrations.
+
+## Diagnose a rejected migration target safely
+
+At commit `7ab0282`, `validate_target()` used one plain `ValueError` for four
+conditions: host missing/not ending in `.neon.tech`, hostname containing
+`-pooler`, database name not exactly `quakeph`, or `sslmode` not exactly `require`
+or `verify-full`. The old log does not identify which condition failed. URL
+parsing or later migration code can also raise a ValueError; do not infer that
+any migration completed from the exception class alone.
+
+Verify the GitHub Environment `quakeph-production` secret
+`QUAKEPH_DATABASE_URL_DIRECT` contains just the direct URL (not a `psql` command,
+quoted shell expression, project name, or pooled connection). In Neon's Connect
+panel choose the correct separate QuakePH project/branch, database **quakeph**,
+and connection pooling **off**, and preserve its TLS query parameters. A Neon
+project named QuakePH does not establish that the connection's database path is
+`/quakeph`; the default database may still be `neondb`. Do not paste the URL into
+logs/chat or change the guard to accept another database.
+
+New diagnostics print a stage plus fixed failed-check identifiers only:
+
+| `failed_checks` item | Required correction/check |
+| --- | --- |
+| `database_url_present` | The named environment secret must exist and be nonempty. |
+| `database_url_parseable` | Store only a valid connection URL; encode special password characters. |
+| `neon_hostname` | Use a Neon hostname ending `.neon.tech`. |
+| `direct_connection` | Copy the direct endpoint; hostname must not contain `-pooler`. |
+| `database_name_quakeph` | Select the actual database `quakeph`; creating/renaming a project is insufficient. |
+| `tls_sslmode` | Keep `sslmode=require` or `sslmode=verify-full` in the URL query. |
+
+`python -m app.hosted check` validates settings/target only and returns before
+creating an engine, connecting, acquiring a lock, or changing schema/data. The
+migration workflow runs this preflight first and exits before migration if it
+fails. Later failures identify stages such as `database_lock`, `migration_upgrade`,
+or `schema_check`, without printing exception messages/URLs. Rerunning the full
+migration workflow after preflight succeeds will still apply migrations; do that
+only when authorized and ready. This diagnostic change itself runs no migration.

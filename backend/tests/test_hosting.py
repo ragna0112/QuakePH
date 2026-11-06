@@ -121,3 +121,50 @@ def test_hosted_partial_import_exits_nonzero_and_omits_raw_errors(monkeypatch, c
     output = capsys.readouterr().out
     assert 'secret' not in output
     assert json.loads(output)['rejected'] == 1
+
+
+@pytest.mark.parametrize('url,checks', [
+    ('', ['database_url_present']),
+    ('not a connection URL', ['database_url_parseable']),
+    ('postgresql://u:p@localhost/quakeph?sslmode=require', ['neon_hostname']),
+    ('postgresql://u:p@ep-test-pooler.aws.neon.tech/quakeph?sslmode=require', ['direct_connection']),
+    ('postgresql://u:p@ep-test.aws.neon.tech/neondb?sslmode=require', ['database_name_quakeph']),
+    ('postgresql://u:p@ep-test.aws.neon.tech/quakeph', ['tls_sslmode']),
+])
+def test_safe_target_diagnostics_without_database_access(monkeypatch, capsys, url, checks):
+    monkeypatch.setattr(hosted, 'get_settings', lambda: Settings(_env_file=None, database_url=url))
+    engine = Mock()
+    monkeypatch.setattr(hosted, 'get_engine', engine)
+    assert hosted.run('check') == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result['stage'] == 'target_validation'
+    assert result['failed_checks'] == checks
+    assert 'neon.tech' not in json.dumps(result)
+    engine.assert_not_called()
+
+
+def test_check_success_cannot_connect_or_migrate(monkeypatch, capsys):
+    monkeypatch.setattr(hosted, 'get_settings', lambda: Settings(_env_file=None, database_url=
+        'postgresql://u:private-password@ep-test.aws.neon.tech/quakeph?sslmode=require'))
+    engine, upgrade = Mock(), Mock()
+    monkeypatch.setattr(hosted, 'get_engine', engine)
+    monkeypatch.setattr(hosted.command, 'upgrade', upgrade)
+    assert hosted.run('check') == 0
+    assert 'private-password' not in capsys.readouterr().out
+    engine.assert_not_called()
+    upgrade.assert_not_called()
+
+
+@pytest.mark.parametrize('method,stage', [('upgrade', 'migration_upgrade'), ('check', 'schema_check')])
+def test_migration_failure_stage_is_safe(monkeypatch, capsys, method, stage):
+    monkeypatch.setattr(hosted, 'get_settings', lambda: Mock())
+    monkeypatch.setattr(hosted, 'validate_target', lambda settings: None)
+    monkeypatch.setattr(hosted, 'get_engine', Mock(return_value=Mock()))
+    monkeypatch.setattr(hosted, 'session_lock', lambda *args: nullcontext())
+    monkeypatch.setattr(hosted.command, 'upgrade', Mock())
+    monkeypatch.setattr(hosted.command, 'check', Mock())
+    getattr(hosted.command, method).side_effect = ValueError('private-password and private-host')
+    assert hosted.run('migrate') == 1
+    output = capsys.readouterr().out
+    assert json.loads(output)['stage'] == stage
+    assert 'private-password' not in output and 'private-host' not in output

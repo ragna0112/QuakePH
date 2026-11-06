@@ -36,4 +36,6 @@ jobs:
           MAX_LATITUDE: '22'
           MIN_LONGITUDE: '116'
           MAX_LONGITUDE: '130'
-        run: uv run --directory backend --locked --no-dev python -m app.hosted migrate
+        run: |
+          uv run --directory backend --locked --no-dev python -m app.hosted check
+          uv run --directory backend --locked --no-dev python -m app.hosted migrate
