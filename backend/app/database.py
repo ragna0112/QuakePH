@@ -1,3 +1,6 @@
+import json
+import logging
+import re
 from functools import lru_cache
 
 from sqlalchemy import create_engine, event, text
@@ -37,3 +40,23 @@ def get_engine():
 def check_database() -> None:
     with get_engine().connect() as connection:
         connection.execute(text("SELECT 1"))
+
+
+def log_database_failure(exc, operation):
+    """Emit fixed categories and validated SQLSTATE only, never driver text/SQL."""
+    original = getattr(exc, 'orig', None)
+    state = getattr(original, 'sqlstate', None)
+    state = state if isinstance(state, str) and re.fullmatch(r'[0-9A-Z]{5}', state) else None
+    categories = {'42P01': 'missing_table', '42703': 'missing_column',
+                  '42501': 'permission_denied', '25006': 'read_only_violation',
+                  '25001': 'transaction_state', '57014': 'query_cancelled',
+                  '28P01': 'authentication_failed', '3D000': 'database_missing'}
+    category = categories.get(state, 'database_error')
+    if state and state.startswith('08'):
+        category = 'connection_failure'
+    logging.getLogger('quakeph.database').error(json.dumps({
+        'event': 'database_failure',
+        'operation': operation if operation in ('dashboard_query', 'readiness') else 'database',
+        'category': category, 'sqlstate': state,
+        'connection_invalidated': bool(getattr(exc, 'connection_invalidated', False)),
+    }))

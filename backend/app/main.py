@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import get_settings
-from app.database import check_database
+from app.database import check_database, log_database_failure
 from app.api import router
 
 app = FastAPI(title="QuakePH", version="0.1.0")
@@ -15,6 +15,7 @@ app.include_router(router)
 
 @app.exception_handler(SQLAlchemyError)
 async def database_unavailable(request, exc):
+    log_database_failure(exc, 'dashboard_query')
     return JSONResponse(status_code=503, content={'detail': 'Database unavailable; retry after PostgreSQL is ready.'})
 
 
@@ -29,7 +30,8 @@ def readiness():
     """Readiness verifies a real database query without exposing connection details."""
     try:
         check_database()
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
+        log_database_failure(exc, 'readiness')
         return JSONResponse(status_code=503, content={"status": "not_ready", "database": "unavailable"})
     return {"status": "ready", "database": "ok"}
 
